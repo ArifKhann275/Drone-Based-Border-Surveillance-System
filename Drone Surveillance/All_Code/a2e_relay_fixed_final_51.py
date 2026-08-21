@@ -50,66 +50,48 @@ from scipy.stats import wilcoxon, ttest_rel
 # ══════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════
-NUM_DRONES = 4                  # simultaneously-patrolling drones (fixed, matches a20.STATIONS)
-RESERVE_POOL_SIZE = 4           # extra idle spare drones (one pre-positioned per station)
-RELAY_SAFETY_FLOOR = 8.0       # % battery a candidate must keep in reserve after the trip
-COVERAGE_STALENESS_CAP_STEPS = 200   # same normalization a20.zone_info() uses (tgap)
-THREAT_ZONE_PENALTY = 2.0      # penalty multiplier if a threat zone is left unattended
-PRIORITY_ZONE_WEIGHT = 1.0     # weight for border priority
+NUM_DRONES = 4                 
+RESERVE_POOL_SIZE = 4           
+RELAY_SAFETY_FLOOR = 8.0     
+COVERAGE_STALENESS_CAP_STEPS = 200 
+THREAT_ZONE_PENALTY = 2.0    
+PRIORITY_ZONE_WEIGHT = 1.0     
 
-# Utility-function weights (Moved to a dictionary for Sensitivity Analysis)
+
 DEFAULT_WEIGHTS = {
-    # All three terms are costs to the mission. Battery is NOT a soft utility
-    # benefit anymore: feasibility is enforced as a hard constraint in
-    # _feasibility(), which prevents travel energy from being double-counted
-    # through both "battery margin" and "energy cost".
-    "W_TRAVEL_ENERGY": 1.0,      # travel energy from a20 OWT-A* model, in battery-% equivalent
-    "W_COVERAGE_LOSS": 25.0,     # marginal surveillance-staleness cost, normalized to [0,1]
-    "W_RELAY_DELAY": 0.4,        # small delay penalty, measured in simulation steps
+   
+    "W_TRAVEL_ENERGY": 1.0,    
+    "W_COVERAGE_LOSS": 25.0,    
+    "W_RELAY_DELAY": 0.4,       
 }
 
-# ── Policy D: fuzzy multi-attribute relay selection ─────────────────────
-# Attribute weights for select_fuzzy_relay(). These are NOT the same kind
-# of object as DEFAULT_WEIGHTS (raw cost multipliers) -- they are relative
-# IMPORTANCE weights (should sum to ~1.0) applied AFTER each attribute has
-# already been fuzzy-normalized onto a common [0,1] membership scale, per
-# the fuzzy-optimum-selection method the paper cites. See select_fuzzy_relay()
-# docstring for the fidelity caveat versus the original paper's own 4
-# UAV-alternative attributes (which require a continuous-space RF/
-# k-connectivity model this codebase does not implement).
+
 FUZZY_ATTR_WEIGHTS = {
-    "distance": 0.30,        # analogue of the paper's link/hop-distance attribute
-    "battery_margin": 0.30,  # analogue of the paper's energy/endurance attribute
-    "coverage_loss": 0.25,   # analogue of the paper's mission-payoff attribute
-    "relay_delay": 0.15,     # analogue of the paper's latency attribute
+    "distance": 0.30,        
+    "battery_margin": 0.30, 
+    "coverage_loss": 0.25,  
+    "relay_delay": 0.15,     
 }
 
-# ── Policy C: RelayScore weights, APPLIED TO POOL-NORMALIZED ATTRIBUTES ──
-# BUG FIX (Aug 2026): DEFAULT_WEIGHTS above multiplies RAW, physically-unit-ed
-# costs together (travel_energy in battery-%, coverage_loss in [0, ~0.03],
-# relay_delay in steps). Empirically, travel_energy sits in the 5-15 range
-# while 25*coverage_loss only reaches ~0.1-0.75 -- so coverage_loss ended up
-# contributing under ~5% of total_cost even with W_COVERAGE_LOSS=25, and
-# RelayScore's ranking collapsed to "cheapest energy + shortest delay",
-# almost completely ignoring the coverage term its own docstring claims to
-# optimize. This was confirmed on real run data: RelayScore's chosen
-# candidates had ~6x HIGHER avg_relay_coverage_gap than fuzzy MADM's, despite
-# fuzzy MADM giving coverage only 25% importance vs RelayScore's intended
-# dominant weighting.
-#
-# FIX: normalize travel_energy / coverage_loss / relay_delay onto a common
-# [0,1] "how good is this candidate on this attribute, relative to the other
-# feasible candidates right now" scale -- the SAME normalization step
-# select_fuzzy_relay() (Policy D) already uses via _fuzzy_normalize() --
-# BEFORE applying importance weights. See _relay_utility_pool(). These
-# weights now mean RELATIVE IMPORTANCE (should sum to ~1.0), exactly like
-# FUZZY_ATTR_WEIGHTS, NOT raw cost multipliers.
+
 NORMALIZED_WEIGHTS = {
     "W_TRAVEL_ENERGY": 0.35,
     "W_COVERAGE_LOSS": 0.40,
     "W_RELAY_DELAY": 0.25,
 }
 
+
+NORMALIZED_WEIGHTS_G = {
+    "W_TRAVEL_ENERGY": 0.30,
+    "W_COVERAGE_LOSS": 0.30,
+    "W_RELAY_DELAY": 0.20,
+    "W_BATTERY_MARGIN": 0.20,
+}
+
+
+BATTERY_MARGIN_SATURATION_PCT = 25.0
+
+NORMALIZED_WEIGHTS_H = dict(NORMALIZED_WEIGHTS_G)  
 
 # ══════════════════════════════════════════════════════════════
 # FLEET INITIALIZATION
@@ -125,20 +107,16 @@ def _new_drone(idx, seed):
         "home_station": (r, c),
         "r": start_r, "c": start_c, "pr": None, "pc": None,
         "battery": 100.0,
-        "cycles": 0,                # completed full-recharge count, feeds SOH aging model
-                                     # (a20.USE_SOH_AGING) -- per-DRONE, not fleet-wide, so a
-                                     # drone that has cycled through many relief trips ages
-                                     # independently of its fleet-mates
+        "cycles": 0,               
         "target_zone": None, "target_cell": None,
         "zone_rng": random.Random(seed * 97 + idx * 31 + 17),
-        "role": "patrol",          # patrol | relay_incoming | returning
-        "rendezvous_id": None,     # which drone id this one is relaying toward (if relay_incoming)
-        "awaiting_relay": False,   # True once this drone has flagged low battery and a relay is inbound
-        "return_target": None,    # station coords this drone heads to when role == returning
-        "relay_episode_counted": False,  # True once this low-battery episode has already
-                                          # incremented relay_requested (see step_fleet());
-                                          # reset when the episode is resolved so the NEXT
-                                          # low-battery episode can be counted separately.
+        "role": "patrol",         
+        "rendezvous_id": None,    
+        "awaiting_relay": False,  
+        "return_target": None,   
+        "relay_episode_counted": False,  
+                                         
+                                         
     }
 
 
@@ -166,13 +144,12 @@ def init_fleet(seed, num_drones=NUM_DRONES, num_reserves=RESERVE_POOL_SIZE):
         "RC": 0,          
         "target_patrol_count": num_drones,   
         "log": [],
-        "first_all_threats_step": None,   # step at which len(detected) first reached NUM_THREATS
-        "first_full_coverage_step": None, # step at which coverage_pct(g) first reached 100
-        "relay_requested": 0,   # incremented ONCE per low-battery episode (see step_fleet())
-        "relay_fulfilled": 0,   # incremented every time a feasible candidate was actually found
-        "total_energy_consumed": 0.0,   # running sum of EVERY step-cost across ALL drones,
-                                         # NEVER reset by recharge -- a true total-work metric,
-                                         # mirrors a20.DroneSimHeadless's own self.s_energy pattern.
+        "first_all_threats_step": None,   
+        "first_full_coverage_step": None, 
+        "relay_requested": 0,  
+        "relay_fulfilled": 0,  
+        "total_energy_consumed": 0.0,  
+                                        
     }
 
 
@@ -214,14 +191,7 @@ def _safe_wilcoxon(x, y):
         _stat, p = wilcoxon([a for a, _ in pairs], [b for _, b in pairs])
         return {"mean_diff": mean_diff, "wilcoxon_p": round(float(p), 5)}
     except Exception as e:
-        # Common cause: numpy>=2.0 paired with a scipy build too old to
-        # support it -- wilcoxon()'s internal error-handling path itself
-        # crashes (AttributeError on np.AxisError) before it can even
-        # return a real statistical result. ttest_rel() runs through a
-        # different scipy code path and is usually unaffected, so fall
-        # back to a paired t-test rather than silently losing the
-        # significance test entirely. Flagged via "test_used" so it's
-        # clear in the output which test actually produced the p-value.
+       
         try:
             _stat2, p2 = ttest_rel([a for a, _ in pairs], [b for _, b in pairs])
             return {"mean_diff": mean_diff, "wilcoxon_p": round(float(p2), 5),
@@ -344,9 +314,7 @@ def _coverage_loss_for_candidate(candidate, needer, g, detected, step, relay_del
     projected_tgap = min((info["raw_gap"] + relay_delay) / cap, 1.0)
     marginal_loss = max(0.0, projected_tgap - current_tgap)
 
-    # Threat / border priority can increase the mission impact of leaving a
-    # strategically important zone unattended. These fields already exist in
-    # a20.zone_info(), so no extra "ground truth" state is invented here.
+   
     has_threat = bool(info.get("has_threat", False))
     border_pr = float(info.get("border_pr", 0.0))
     penalty_mult = 1.0
@@ -408,8 +376,7 @@ def relay_score(candidate, needer, g, detected, step, weights=None):
     delay_cost = weights["W_RELAY_DELAY"] * relay_delay
     total_cost = energy_cost + coverage_cost + delay_cost
 
-    # Higher is better. Zero is the theoretical cost of a perfect
-    # zero-energy/zero-delay/zero-impact relay, which is unattainable.
+    
     score = -total_cost
 
     diag = {
@@ -417,7 +384,7 @@ def relay_score(candidate, needer, g, detected, step, weights=None):
         "role": candidate["role"],
         "distance": dist,
         "travel_energy": round(travel_energy, 3),
-        "battery_margin": round(battery_margin, 2),  # feasibility/headroom only
+        "battery_margin": round(battery_margin, 2),  
         "battery_feasible": True,
         "coverage_loss": round(coverage_loss, 6),
         "raw_marginal_coverage_loss": round(raw_marginal_loss, 6),
@@ -491,10 +458,7 @@ def _relay_utility_pool(feasible, needer, g, detected, step, weights=None):
     w = weights
     scored = []
     for i, r in enumerate(rows):
-        # Each membership term is already "1.0 = best candidate on this
-        # attribute", so a plain weighted SUM is the utility -- higher is
-        # better, same "bigger score wins" convention the old relay_score()
-        # used, just no longer vulnerable to raw-unit scale mismatch.
+       
         utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
                    + w["W_COVERAGE_LOSS"] * cov_r[i]
                    + w["W_RELAY_DELAY"] * delay_r[i])
@@ -541,20 +505,220 @@ def select_best_relay(needer, drones, g, detected, step, weights=None):
     return best_cand, [diag for _, _, diag in scored]
 
 
+
+def _relay_utility_pool_g(feasible, needer, g, detected, step, weights=None):
+    """Mirrors _relay_utility_pool() exactly (same feasible pool, same
+    coverage-loss computation, same weighted-SUM combination rule),
+    adding ONE new ranked attribute: battery_margin (higher = better,
+    fuzzy-normalized across the candidate pool exactly like the other
+    three). Everything else is identical to C on purpose, so any
+    difference in outcome vs C isolates the battery-margin term's own
+    effect."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS_G
+
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": travel_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0,
+            "membership_delay": 1.0, "membership_battery": 1.0,
+            "score": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+    batt_r = _fuzzy_normalize([r["battery_margin"] for r in rows], higher_is_better=True)
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i]
+                   + w["W_BATTERY_MARGIN"] * batt_r[i])
+
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "membership_battery": round(batt_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_battery_aware(needer, drones, g, detected, step, weights=None):
+    """Policy G: RelayScore + a genuine ranked battery_margin attribute
+    (see the section docstring above for why this is a structurally
+    different addition from Policy E's reweighting or Policy F's
+    prediction, and what specific C-vs-D code gap it targets). Compare
+    against C (isolates the battery-margin term's own effect), D (does
+    battery-awareness alone close the fuzzy-MADM gap?), and F (battery-
+    awareness vs prediction -- which refinement earns its complexity?)."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_g(feasible, needer, g, detected, step, weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY H — BATTERY-MARGIN-AWARE RELAYSCORE, SATURATION-CAPPED (fixes
+# the relay-starvation failure mode diagnosed in Policy G)
+# ══════════════════════════════════════════════════════════════
+def _relay_utility_pool_h(feasible, needer, g, detected, step, weights=None):
+    """Identical to _relay_utility_pool_g() (same feasible pool, same
+    energy/coverage/delay computation, same weighted-SUM combination),
+    with exactly ONE change: battery_margin uses an ABSOLUTE-scale
+    membership (anchored to RELAY_SAFETY_FLOOR / BATTERY_MARGIN_SATURATION_PCT)
+    instead of G's pool-relative fuzzy-normalize. See
+    BATTERY_MARGIN_SATURATION_PCT's docstring above for why pool-relative
+    normalization can't be fixed by capping alone in the common 2-candidate
+    case, and why this specific fix addresses Policy G's diagnosed
+    relay-starvation failure mode."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS_H
+
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": travel_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0,
+            "membership_delay": 1.0, "membership_battery": 1.0,
+            "score": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+    
+    batt_span = max(BATTERY_MARGIN_SATURATION_PCT - RELAY_SAFETY_FLOOR, 1e-9)
+    batt_r = [
+        max(0.0, min(1.0, (r["battery_margin"] - RELAY_SAFETY_FLOOR) / batt_span))
+        for r in rows
+    ]
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i]
+                   + w["W_BATTERY_MARGIN"] * batt_r[i])
+
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "battery_margin_capped": round(min(r["battery_margin"], BATTERY_MARGIN_SATURATION_PCT), 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "membership_battery": round(batt_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_battery_aware_capped(needer, drones, g, detected, step, weights=None):
+    """Policy H: Policy G with the battery_margin saturation-cap fix.
+    Compare against G (isolates the fix's own effect -- same weights,
+    same everything else) and C (does fixed battery-awareness beat plain
+    RelayScore once the starvation bug is gone?)."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_h(feasible, needer, g, detected, step, weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
 # ══════════════════════════════════════════════════════════════
 # POLICY E — DYNAMIC-WEIGHT RELAYSCORE (context-aware refinement on top
 # of the pool-normalization fix, NOT a replacement for it)
 # ══════════════════════════════════════════════════════════════
-# Tunable pressure thresholds. Kept as module-level constants (like
-# RELAY_SAFETY_FLOOR etc. above) so they show up in one obvious place for
-# sensitivity analysis, rather than being buried as magic numbers.
-COVERAGE_PRESSURE_THRESHOLD = 0.5   # mean zone staleness / cap, above which
-                                      # W_COVERAGE_LOSS starts getting boosted
-COVERAGE_PRESSURE_MAX_BOOST = 2.0    # multiplier applied at pressure == 1.0
-BATTERY_CRITICAL_MARGIN = 5.0        # % headroom above RELAY_SAFETY_FLOOR,
-                                      # below which W_TRAVEL_ENERGY starts
-                                      # getting boosted
-BATTERY_CRITICAL_MAX_BOOST = 2.5     # multiplier applied at zero headroom
+
+COVERAGE_PRESSURE_THRESHOLD = 0.5   
+                                     
+COVERAGE_PRESSURE_MAX_BOOST = 2.0   
+BATTERY_CRITICAL_MARGIN = 5.0        
+                                      
+BATTERY_CRITICAL_MAX_BOOST = 2.5    
 
 
 def _dynamic_weights(needer, g, step, base_weights=None,
@@ -590,10 +754,7 @@ def _dynamic_weights(needer, g, step, base_weights=None,
     """
     w = dict(base_weights or NORMALIZED_WEIGHTS)
 
-    # ── Coverage pressure: mean zone staleness across the WHOLE map, not
-    # just this one candidate's marginal effect -- a global signal that
-    # _relay_utility_pool()'s per-decision normalization has no visibility
-    # into, since that only compares candidates against each other.
+    
     staleness_values = [step - c["last_visited_step"] for c in g.values()
                          if not c.get("is_station")]
     if staleness_values:
@@ -608,8 +769,7 @@ def _dynamic_weights(needer, g, step, base_weights=None,
         boost = 1.0 + (coverage_pressure_max_boost - 1.0) * ramp
         w["W_COVERAGE_LOSS"] *= boost
 
-    # ── Battery pressure: how close THIS needer is to the hard feasibility
-    # floor right now, independent of which candidate ends up chosen.
+    
     battery_headroom = needer.get("battery", 100.0) - RELAY_SAFETY_FLOOR
     if battery_headroom < battery_critical_margin:
         deficit = max(0.0, battery_critical_margin - battery_headroom)
@@ -658,6 +818,184 @@ def select_best_relay_dynamic(needer, drones, g, detected, step, weights=None,
     return best_cand, diags
 
 
+
+PREDICTIVE_COVERAGE_HORIZON = 30  
+
+
+def _predicted_travel_energy(candidate, needer, step):
+    """Travel energy using wind AT THE CANDIDATE'S ESTIMATED ARRIVAL STEP
+    (step + Manhattan distance) instead of wind AT THE CURRENT STEP. Exact
+    (not approximate) because a20's dynamic wind is a deterministic
+    function of step -- see module docstring above.
+
+    If a20.WIND_DYNAMIC_ENABLED is False, get_current_wind() returns the
+    same static values regardless of which step is asked for, so this
+    transparently degrades to being identical to the current-wind energy
+    (Policy F reduces to Policy C's energy term with no special-casing
+    needed here).
+    """
+    dist = _manhattan(candidate["r"], candidate["c"], needer["r"], needer["c"])
+    saved_step = a20._SIM_CLOCK["step"]
+    try:
+        a20._SIM_CLOCK["step"] = step + dist
+        energy = a20.energy_to_travel(candidate["r"], candidate["c"], needer["r"], needer["c"])
+    finally:
+        a20._SIM_CLOCK["step"] = saved_step   # ALWAYS restore, even on exception
+    return energy
+
+
+def _predicted_coverage_loss_for_candidate(candidate, needer, g, detected, step, relay_delay,
+                                             horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Same idea as _coverage_loss_for_candidate(), but projects the
+    candidate's currently-claimed zone's staleness `horizon` steps further
+    than just the relay-arrival window -- representing that the borrowed
+    patrol drone won't be back to that zone for a while after the swap,
+    not just during the trip itself.
+
+    Idle reserves and candidates with no target_zone still return 0.0,
+    exactly like the non-predictive version (they aren't abandoning any
+    patrol assignment either way, so there's nothing to project forward).
+    """
+    if candidate["role"] == "idle_reserve" or candidate["target_zone"] is None:
+        return 0.0, 0.0, 0.0, None
+
+    info = a20.zone_info(candidate["target_zone"][0], candidate["target_zone"][1],
+                          0, 0, g, detected, step)
+    if not info:
+        return 0.0, 0.0, 0.0, None
+
+    cap = max(float(COVERAGE_STALENESS_CAP_STEPS), 1.0)
+    current_tgap = min(info["raw_gap"] / cap, 1.0)
+    projected_tgap = min((info["raw_gap"] + relay_delay + horizon) / cap, 1.0)
+    marginal_loss = max(0.0, projected_tgap - current_tgap)
+
+    has_threat = bool(info.get("has_threat", False))
+    border_pr = float(info.get("border_pr", 0.0))
+    penalty_mult = 1.0
+    if has_threat:
+        penalty_mult += THREAT_ZONE_PENALTY
+    penalty_mult += PRIORITY_ZONE_WEIGHT * border_pr
+
+    weighted_loss = marginal_loss * penalty_mult
+    return weighted_loss, marginal_loss, current_tgap, {
+        "has_threat": has_threat, "border_priority": border_pr,
+        "penalty_multiplier": round(penalty_mult, 3),
+        "current_tgap": round(current_tgap, 3),
+        "projected_tgap": round(projected_tgap, 3),
+        "predictive_horizon": horizon,
+    }
+
+
+def _relay_utility_pool_predictive(feasible, needer, g, detected, step, weights=None,
+                                     horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Mirrors _relay_utility_pool() exactly (same pool-normalization,
+    same weighted-sum combination rule), except travel_energy and
+    coverage_loss are computed with the PREDICTIVE functions above instead
+    of current-state ones. relay_delay is left as-is (it IS already the
+    predicted arrival time, by definition -- there's nothing to predict
+    further about it)."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS
+
+    rows = []
+    for cand, _travel_energy_current, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        pred_energy = _predicted_travel_energy(cand, needer, step)
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _predicted_coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay, horizon=horizon
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": pred_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"], "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0, "membership_delay": 1.0,
+            "score": 1.0, "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i])
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"], "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_predictive(needer, drones, g, detected, step, weights=None,
+                                   horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Policy F: RelayScore with predictive (future-wind energy +
+    extended-horizon coverage-loss) candidate attributes, same pool and
+    same combination rule as C/D/E. Compare against C (ranking-rule
+    effect isolated from prediction) and E (prediction vs reweighting, at
+    equal implementation-cost footing) to see which refinement actually
+    earns its complexity."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_predictive(feasible, needer, g, detected, step, weights, horizon=horizon)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+def tune_predictive_horizon(train_seeds, horizon_grid, max_steps=None, metric="coverage_pct"):
+    """Sweeps PREDICTIVE_COVERAGE_HORIZON on TRAIN seeds only (same
+    train/test discipline used for SSE_LAMBDA earlier in this project --
+    see run_terrain_aware_sse_experiment.py) so the reported horizon isn't
+    picked by peeking at the same seeds used for the final comparison.
+    Returns sorted results; caller should validate the winner on a
+    DISJOINT test seed set via run_six_way_comparison() before reporting
+    it in the thesis."""
+    max_steps = max_steps or a20.MAX_STEPS
+    results = []
+    for h in horizon_grid:
+        selector = lambda needer, drones, g, detected, step, weights=None, _h=h: \
+            select_best_relay_predictive(needer, drones, g, detected, step, weights=weights, horizon=_h)
+        vals = []
+        for seed in train_seeds:
+            m = simulate_fleet(seed, relay_selector=selector, max_steps=max_steps)
+            vals.append(m.get(metric))
+        clean = [v for v in vals if isinstance(v, (int, float))]
+        mean_v = round(statistics.mean(clean), 4) if clean else None
+        results.append({"horizon": h, f"mean_{metric}": mean_v})
+        print(f"  [PREDICTIVE_COVERAGE_HORIZON={h}] mean_{metric}={mean_v}")
+    results.sort(key=lambda r: (r[f"mean_{metric}"] is None, -(r[f"mean_{metric}"] or 0)))
+    return results
+
+
 # ══════════════════════════════════════════════════════════════
 # BASELINE (generalized nearest-only, for fair ablation comparison)
 # ══════════════════════════════════════════════════════════════
@@ -678,8 +1016,7 @@ def select_nearest_relay(needer, drones, g, detected, step, weights=None):
         )
     )[0]
 
-    # Build diagnostics using the same component definitions as C, but do
-    # NOT use the RelayScore to select the baseline.
+    
     _score, best_diag = relay_score(
         best, needer, g, detected, step, weights=weights
     )
@@ -728,7 +1065,7 @@ def select_fuzzy_relay(needer, drones, g, detected, step, weights=None, p=2):
         rows.append({
             "cand": cand,
             "distance": dist,
-            "travel_energy": travel_energy,  # FIX: Store travel energy
+            "travel_energy": travel_energy, 
             "battery_margin": battery_margin,
             "coverage_loss": coverage_loss,
             "relay_delay": relay_delay,
@@ -739,7 +1076,7 @@ def select_fuzzy_relay(needer, drones, g, detected, step, weights=None, p=2):
         diag = {
             "candidate_id": only["cand"]["id"],
             "distance": only["distance"],
-            "travel_energy": round(only["travel_energy"], 3), # FIX: Output to diag
+            "travel_energy": round(only["travel_energy"], 3),
             "battery_margin": round(only["battery_margin"], 2),
             "coverage_loss": round(only["coverage_loss"], 6),
             "relay_delay": only["relay_delay"],
@@ -769,7 +1106,7 @@ def select_fuzzy_relay(needer, drones, g, detected, step, weights=None, p=2):
             "candidate_id": r["cand"]["id"],
             "role": r["cand"]["role"],
             "distance": r["distance"],
-            "travel_energy": round(r["travel_energy"], 3), # FIX: Output to diag
+            "travel_energy": round(r["travel_energy"], 3), 
             "battery_margin": round(r["battery_margin"], 2),
             "coverage_loss": round(r["coverage_loss"], 6),
             "relay_delay": r["relay_delay"],
@@ -791,7 +1128,7 @@ def select_fuzzy_relay(needer, drones, g, detected, step, weights=None, p=2):
 # ══════════════════════════════════════════════════════════════
 def step_fleet(state, relay_selector=select_best_relay):
     g, detected, drones, step = state["g"], state["detected"], state["drones"], state["step"]
-    a20.advance_sim_clock(step)   # keep dynamic-wind clock in sync (no-op if WIND_DYNAMIC_ENABLED=False)
+    a20.advance_sim_clock(step)   
     by_id = {d["id"]: d for d in drones}
 
     for d in drones:
@@ -800,7 +1137,7 @@ def step_fleet(state, relay_selector=select_best_relay):
         tr, tc = d["return_target"]
         if (d["r"], d["c"]) == (tr, tc):
             d["battery"] = 100.0
-            d["cycles"] += 1  # one more full recharge cycle completed -> pack ages (SOH model)
+            d["cycles"] += 1  
             d["target_zone"] = None; d["target_cell"] = None
             d["pr"] = d["pc"] = None
             state["RC"] += 1
@@ -831,24 +1168,13 @@ def step_fleet(state, relay_selector=select_best_relay):
         tr, tc = needer["r"], needer["c"]
         dist_now = _manhattan(d["r"], d["c"], tr, tc)
         if dist_now <= 1:
-            # ✅ RELAY FULFILLED — counted HERE (handoff actually completed),
-            # not at dispatch time. Before this fix, relay_fulfilled was
-            # incremented the moment a candidate was CHOSEN, which measures
-            # "did the algorithm find someone", not "did the mission-critical
-            # handoff actually happen". Under current physics a dispatched
-            # relay_incoming drone always eventually reaches the needer
-            # (movement is never hard-gated on battery), so this rarely
-            # changes the final count today -- but it is the methodologically
-            # correct place to count it, and stays correct if a future
-            # failure mode (e.g. battery hits 0 mid-transit and the drone
-            # can no longer move) is ever added.
+           
             state["relay_fulfilled"] += 1
             st = a20.nearest_st(needer["r"], needer["c"])
             needer["role"] = "returning"
             needer["return_target"] = st
             needer["awaiting_relay"] = False
-            needer["relay_episode_counted"] = False   # episode resolved -> next low-battery
-                                                        # spell is a NEW episode
+            needer["relay_episode_counted"] = False   
             d["role"] = "patrol"
             d["rendezvous_id"] = None
             d["target_zone"] = None; d["target_cell"] = None
@@ -872,17 +1198,7 @@ def step_fleet(state, relay_selector=select_best_relay):
         if not d["awaiting_relay"]:
             nh, _st = a20.needs_handoff_now(d["r"], d["c"], d["battery"])
             if nh:
-                # ✅ RELAY REQUEST COUNTER — counts EPISODES, not steps.
-                # One continuous low-battery spell (needs_handoff_now stays
-                # True across possibly several consecutive steps while no
-                # feasible candidate is found) increments relay_requested
-                # exactly ONCE, on its first step, via relay_episode_counted.
-                # This makes relay_success_rate = fulfilled/requested a real
-                # per-episode fulfillment rate instead of being diluted by
-                # however many retry-steps a hard episode happened to need.
-                # The flag resets (see step_fleet(), relay_incoming handling
-                # above) once the handoff actually completes, so the next
-                # distinct low-battery episode is counted fresh.
+                
                 if not d["relay_episode_counted"]:
                     state["relay_requested"] += 1
                     d["relay_episode_counted"] = True
@@ -893,7 +1209,7 @@ def step_fleet(state, relay_selector=select_best_relay):
                     real["role"] = "relay_incoming"
                     real["rendezvous_id"] = d["id"]
                     
-                    # ✅ DECISION LOGGING
+                    
                     state["log"].append({
                         "step": step,
                         "needer_id": d["id"],
@@ -919,32 +1235,12 @@ def step_fleet(state, relay_selector=select_best_relay):
         if not d["target_zone"]:
             rk = a20.rank_zones(d["r"], d["c"], g, detected, step)
 
-            # ── ZONE-CLAIMING COORDINATION FIX ──────────────────────────
-            # Previously every patrol drone picked independently, with zero
-            # awareness of what any other drone was already doing. Direct
-            # diagnostic check (500-step, 3 seeds): 2+ drones were targeting
-            # the SAME zone in ~50% of steps. That plausibly explains why the
-            # 8-drone fleet's detection_rate/mission_completed came out WORSE
-            # than a single drone's at 500 steps (86.9%/93.3% single-drone
-            # vs ~89%/27% fleet) despite near-identical raw coverage_pct --
-            # redundant effort on an already-claimed zone doesn't help find
-            # threats sitting in a zone nobody has reached yet.
-            #
-            # Fix: exclude any zone another currently-patrolling drone has
-            # already claimed as ITS target_zone from this drone's ranked
-            # candidate list, before the existing tier/mixed-strategy
-            # selection runs. Nothing about the ranking/selection logic
-            # itself changes -- this only shrinks the candidate POOL, the
-            # same way the relay-selection feasibility gate shrinks a
-            # candidate pool without changing how candidates are scored.
+           
             claimed = {x["target_zone"] for x in drones
                        if x["id"] != d["id"] and x["role"] == "patrol" and x["target_zone"] is not None}
             rk_avail = [entry for entry in rk if entry["zone"] not in claimed]
             if not rk_avail:
-                # Every zone already claimed -- can't happen in practice with
-                # 36 zones and at most NUM_DRONES=4 simultaneous patrol
-                # drones, but fall back to the unfiltered list rather than
-                # leaving this drone with no target at all.
+               
                 rk_avail = rk
 
             d["target_zone"], d["target_cell"] = a20.select_zone_mixed_strategy(
@@ -977,14 +1273,7 @@ def collect_metrics(state):
     g, detected, drones = state["g"], state["detected"], state["drones"]
     active_drones = [d for d in drones]
 
-    # ✅ avg_final_battery previously averaged ALL 8 drones together,
-    # including the idle reserves that sit at 100% doing nothing -- with
-    # NUM_DRONES=4 patrol + RESERVE_POOL_SIZE=4 reserve, that's a 50%
-    # dilution pulling the number up regardless of how hard the patrol
-    # drones actually worked. Split into the two pools that mean different
-    # things; keep "avg_final_battery" as an alias for avg_patrol_battery
-    # (the one every existing PRIMARY/SECONDARY_METRICS list and the
-    # plotting code already reference) so nothing downstream breaks.
+    
     patrol_pool = [d for d in active_drones if d["role"] != "idle_reserve"]
     reserve_pool = [d for d in active_drones if d["role"] == "idle_reserve"]
     avg_patrol_battery = round(statistics.mean(d["battery"] for d in patrol_pool), 2) if patrol_pool else None
@@ -992,17 +1281,13 @@ def collect_metrics(state):
 
     staleness_values = [state["step"] - c["last_visited_step"] for c in g.values() if not c["is_station"]]
     avg_staleness = statistics.mean(staleness_values)
-    max_staleness = max(staleness_values)   # S_max = max_z(t - t_last,z) -- persistent-surveillance metric
+    max_staleness = max(staleness_values)  
 
     requested = state["relay_requested"]
     fulfilled = state["relay_fulfilled"]
     success_rate = round(fulfilled / requested, 4) if requested > 0 else None
 
-    # Pull the CHOSEN candidate's own diag out of each log entry (not every
-    # candidate that was scored) so the averages below reflect the relays
-    # that actually happened, not every option that was merely considered.
-    # select_nearest_relay (baseline) never populates candidates_diag, so
-    # these three will be None for baseline runs -- that's expected, not a bug.
+    
     chosen_diags = []
     for entry in state["log"]:
         for diag in entry["candidates_diag"]:
@@ -1019,26 +1304,26 @@ def collect_metrics(state):
 
     return {
         # ── PRIMARY METRICS ──────────────────────────────────────────
-        "coverage_pct": a20.coverage_pct(g),                       # 1. Coverage %
-        "avg_zone_staleness_steps": round(avg_staleness, 2),       # 2. Average surveillance staleness
-        "max_zone_staleness_steps": max_staleness,                 # 3. Maximum surveillance staleness (S_max)
+        "coverage_pct": a20.coverage_pct(g),                      
+        "avg_zone_staleness_steps": round(avg_staleness, 2),      
+        "max_zone_staleness_steps": max_staleness,                
 
         # ── SECONDARY METRICS ────────────────────────────────────────
-        "detection_rate": detection_rate,                          # threats_detected / threats_total
+        "detection_rate": detection_rate,                         
         "threats_detected": len(detected),
         "threats_total": a20.NUM_THREATS,
         "relay_success_rate": success_rate,
         "avg_relay_delay_steps": avg_relay_delay,
         "avg_relay_energy_pct": avg_relay_energy,
         "avg_relay_coverage_gap": avg_coverage_gap,
-        "mission_completed": state["first_all_threats_step"] is not None,   # all threats found within max_steps?
+        "mission_completed": state["first_all_threats_step"] is not None,   
         "first_all_threats_step": state["first_all_threats_step"],
         "first_full_coverage_step": state["first_full_coverage_step"],
-        "avg_final_battery": avg_patrol_battery,        # ALIAS: patrol-only, NOT diluted by idle reserves
-        "avg_patrol_battery": avg_patrol_battery,        # explicit name, same value as above
-        "avg_reserve_battery": avg_reserve_battery,      # sanity-check number, should sit near 100%
-        "total_energy_consumed": round(state["total_energy_consumed"], 2),  # cumulative, survives recharges
-        "relay_requested": requested,                              # number of relay events (episodes)
+        "avg_final_battery": avg_patrol_battery,       
+        "avg_patrol_battery": avg_patrol_battery,       
+        "avg_reserve_battery": avg_reserve_battery,      
+        "total_energy_consumed": round(state["total_energy_consumed"], 2),
+        "relay_requested": requested,                             
         "relay_fulfilled": fulfilled,
 
         # ── bookkeeping / plotting ────────────────────────────────────
@@ -1090,15 +1375,7 @@ def plot_decision_breakdown(log_entry, weights=DEFAULT_WEIGHTS,
             "Energy Cost (-)": energy_cost,
             "Coverage Cost (-)": cov_loss_cost,
             "Delay Cost (-)": delay_cost,
-            # NOTE: deliberately the SUM of the three raw-unit bars above,
-            # not diag["score"] -- diag["score"] is now the ranking-time
-            # utility, which for Policy C is pool-normalized to [0,1] and
-            # therefore lives on a different scale than these raw-unit cost
-            # bars (which recompute from raw travel_energy/coverage_loss/
-            # relay_delay using whatever `weights` this function was passed).
-            # Using the raw sum keeps the marker visually consistent with
-            # the bars for BOTH old-format (Policy B) and new-format
-            # (Policy C) diagnostics.
+            
             "Net Utility": energy_cost + cov_loss_cost + delay_cost,
         })
 
@@ -1307,13 +1584,7 @@ def run_comparison(seeds, max_steps=None, out_csv=None, weights=None):
 # THREE-WAY COMPARISON: A (original single-drone + nearest handoff)
 #                        vs B (fixed 8-drone fleet + nearest relay)
 #                        vs C (fixed 8-drone fleet + RelayScore)
-#
-# A vs B isolates the FLEET-SIZE effect (1 active drone + serial
-# station-launched backup  ->  8 parallel drones with an idle reserve pool).
-# B vs C isolates the RELAY-INTELLIGENCE effect (same 8-drone fleet, only
-# the candidate-selection rule changes: nearest-distance vs RelayScore).
-# This is exactly the ablation a reviewer needs to see that C's improvement
-# isn't just "more drones" in disguise.
+
 #
 # NOTE on "fixed 8-drone fleet": NUM_DRONES(4) + RESERVE_POOL_SIZE(4) already
 # equals 8 in this file's defaults, so B and C below use init_fleet()'s
@@ -1354,18 +1625,18 @@ def _extract_baseline_a_metrics(seed, max_steps):
         "threats_detected": len(detected),
         "threats_total": a20.NUM_THREATS,
         "relay_success_rate": round(fulfilled / requested, 4) if requested > 0 else None,
-        "avg_relay_delay_steps": None,     # not computed in the original architecture (see docstring)
+        "avg_relay_delay_steps": None,    
         "avg_relay_energy_pct": None,
         "avg_relay_coverage_gap": None,
         "mission_completed": sim.s_first_all is not None,
         "first_all_threats_step": sim.s_first_all,
         "first_full_coverage_step": sim.s_full_cov_step,
         "avg_final_battery": round(sim.s_active["b"], 2),
-        "avg_patrol_battery": round(sim.s_active["b"], 2),   # A only ever has 1 active drone
-        "avg_reserve_battery": None,                          # A has no idle-reserve concept -- N/A
-        "total_energy_consumed": round(sim.s_energy, 2),      # a20's own running total (see DroneSimHeadless),
-                                                                # NOT reset by recharge, same semantics as B/C's
-                                                                # total_energy_consumed -- genuinely comparable
+        "avg_patrol_battery": round(sim.s_active["b"], 2),   
+        "avg_reserve_battery": None,                         
+        "total_energy_consumed": round(sim.s_energy, 2),     
+                                                                
+                                                               
         "relay_requested": requested,
         "relay_fulfilled": fulfilled,
         "RC": sim.sR,
@@ -1622,21 +1893,212 @@ def run_five_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
         n=len(seeds),
     )
     return rows, summary
+
+
+def run_six_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                             num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                             predictive_horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Runs A / B / C / D / E / F, adding F = Policy C plus the predictive
+    layer (select_best_relay_predictive) alongside E = Policy C plus the
+    dynamic-weighting layer, so the two DIFFERENT refinement strategies
+    (reweight existing attributes vs predict future attribute values) are
+    compared on equal footing, same seeds, same fleet:
+
+      C vs F -> does prediction help RelayScore beyond static pool-normalized
+                weighting alone?
+      E vs F -> reweighting vs prediction -- which refinement earns its
+                added complexity?
+      D vs F -> does the predictive RelayScore beat fuzzy MADM?
+
+    IMPORTANT: run tune_predictive_horizon() on a TRAIN seed set DISJOINT
+    from `seeds` before calling this, and pass the tuned value in as
+    predictive_horizon -- do not tune and report on the same seeds.
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    predictive_selector = lambda needer, drones, g, detected, step, weights=None: \
+        select_best_relay_predictive(needer, drones, g, detected, step, weights=weights,
+                                       horizon=predictive_horizon)
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_e = simulate_fleet(seed, relay_selector=select_best_relay_dynamic,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_f = simulate_fleet(seed, relay_selector=predictive_selector,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c), ("D", m_d), ("E", m_e), ("F", m_f)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"C(static): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy): cov={m_d['coverage_pct']}%  |  "
+              f"E(dynamic-weight): cov={m_e['coverage_pct']}%  |  "
+              f"F(predictive): cov={m_f['coverage_pct']}%")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("A", "B", "C", "D", "E", "F"):
+            vals[label] = [r[f"{label}_{metric}"] for r in rows]
+        entry = {}
+        for label in ("A", "B", "C", "D", "E", "F"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fleet_effect_A_vs_B"] = _safe_wilcoxon(vals["A"], vals["B"])
+        entry["relay_intel_effect_B_vs_C"] = _safe_wilcoxon(vals["B"], vals["C"])
+        entry["ranking_rule_effect_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["dynamic_weighting_effect_C_vs_E"] = _safe_wilcoxon(vals["C"], vals["E"])
+        entry["predictive_effect_C_vs_F"] = _safe_wilcoxon(vals["C"], vals["F"])
+        entry["reweight_vs_predict_E_vs_F"] = _safe_wilcoxon(vals["E"], vals["F"])
+        entry["predictive_vs_fuzzy_D_vs_F"] = _safe_wilcoxon(vals["D"], vals["F"])
+        summary[metric] = entry
+
+    print("\n=== A vs B vs C vs D vs E vs F SUMMARY ===")
+    print(f"(predictive_horizon={predictive_horizon})")
+    print("(predictive effect: C->F | reweight-vs-predict: E->F | predictive vs fuzzy: D->F)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fleet_effect_A_vs_B", "A", "B"),
+            ("relay_intel_effect_B_vs_C", "B", "C"),
+            ("ranking_rule_effect_C_vs_D", "C", "D"),
+            ("dynamic_weighting_effect_C_vs_E", "C", "E"),
+            ("predictive_effect_C_vs_F", "C", "F"),
+            ("reweight_vs_predict_E_vs_F", "E", "F"),
+            ("predictive_vs_fuzzy_D_vs_F", "D", "F"),
+        ],
+        n=len(seeds),
+    )
+    return rows, summary
+
+
+def run_seven_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                               num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                               predictive_horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Runs A / B / C / D / E / F / G, adding G = Policy C plus a genuine
+    ranked battery_margin attribute (select_best_relay_battery_aware),
+    alongside E (reweighting) and F (prediction) -- the three DIFFERENT
+    refinement strategies compared on equal footing, same seeds, same
+    fleet:
+
+      C vs G -> does a ranked battery-margin term help RelayScore beyond
+                static pool-normalized weighting alone?
+      D vs G -> does battery-awareness alone close the fuzzy-MADM gap?
+      G vs F -> battery-awareness vs prediction -- which refinement earns
+                its added complexity?
+
+    Use this after run_six_way_comparison() has shown F does not close
+    the C-vs-D gap -- G tests the OTHER concrete hypothesis (the
+    battery_margin ranking-vs-feasibility-only gap between C and D)
+    identified from comparing their code directly, rather than another
+    variation on the wind-prediction idea F already tested.
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    predictive_selector = lambda needer, drones, g, detected, step, weights=None: \
+        select_best_relay_predictive(needer, drones, g, detected, step, weights=weights,
+                                       horizon=predictive_horizon)
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_e = simulate_fleet(seed, relay_selector=select_best_relay_dynamic,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_f = simulate_fleet(seed, relay_selector=predictive_selector,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_g = simulate_fleet(seed, relay_selector=select_best_relay_battery_aware,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c), ("D", m_d),
+                          ("E", m_e), ("F", m_f), ("G", m_g)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"C(static): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy): cov={m_d['coverage_pct']}%  |  "
+              f"F(predictive): cov={m_f['coverage_pct']}%  |  "
+              f"G(battery-aware): cov={m_g['coverage_pct']}%  |  "
+              f"G mission_completed={m_g['mission_completed']}")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("A", "B", "C", "D", "E", "F", "G"):
+            vals[label] = [r[f"{label}_{metric}"] for r in rows]
+        entry = {}
+        for label in ("A", "B", "C", "D", "E", "F", "G"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fleet_effect_A_vs_B"] = _safe_wilcoxon(vals["A"], vals["B"])
+        entry["relay_intel_effect_B_vs_C"] = _safe_wilcoxon(vals["B"], vals["C"])
+        entry["ranking_rule_effect_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["dynamic_weighting_effect_C_vs_E"] = _safe_wilcoxon(vals["C"], vals["E"])
+        entry["predictive_effect_C_vs_F"] = _safe_wilcoxon(vals["C"], vals["F"])
+        entry["battery_aware_effect_C_vs_G"] = _safe_wilcoxon(vals["C"], vals["G"])
+        entry["battery_vs_fuzzy_D_vs_G"] = _safe_wilcoxon(vals["D"], vals["G"])
+        entry["battery_vs_predictive_G_vs_F"] = _safe_wilcoxon(vals["G"], vals["F"])
+        summary[metric] = entry
+
+    print("\n=== A vs B vs C vs D vs E vs F vs G SUMMARY ===")
+    print(f"(predictive_horizon={predictive_horizon})")
+    print("(battery-aware effect: C->G | battery vs fuzzy: D->G | battery vs predictive: G->F)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fleet_effect_A_vs_B", "A", "B"),
+            ("relay_intel_effect_B_vs_C", "B", "C"),
+            ("ranking_rule_effect_C_vs_D", "C", "D"),
+            ("dynamic_weighting_effect_C_vs_E", "C", "E"),
+            ("predictive_effect_C_vs_F", "C", "F"),
+            ("battery_aware_effect_C_vs_G", "C", "G"),
+            ("battery_vs_fuzzy_D_vs_G", "D", "G"),
+            ("battery_vs_predictive_G_vs_F", "G", "F"),
+        ],
+        n=len(seeds),
+    )
+    return rows, summary
+
+
 if __name__ == "__main__":
     import sys
 
-    # Usage: python a2e_relay_fixed_final.py [max_steps] [num_seeds]
-    # Defaults now favor a THESIS-GRADE run (30 seeds) over a quick smoke
-    # test, because 5 seeds is not enough to trust any A/B/C/D difference
-    # (see the significance readout after the four-way comparison below).
-    # For a fast sanity check while iterating on code, run e.g.:
-    #   python a2e_relay_fixed_final.py 300 5
+    
     steps = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     num_seeds = int(sys.argv[2]) if len(sys.argv) > 2 else 30
     seeds = list(range(1, num_seeds + 1))
-    # Lighter seed set for the earlier B-vs-C-only sections and the
-    # sensitivity sweep, so those don't balloon runtime unnecessarily --
-    # trim/expand this independently of the main ABCD seed set above.
+   
     quick_seeds = seeds[:5]
 
     print("\n=== B vs C: FEASIBLE-NEAREST vs CORRECTED RELAYSCORE ===")
@@ -1659,15 +2121,7 @@ if __name__ == "__main__":
         print("ℹ️ No relay decisions occurred in this run to plot.")
 
     print("\n=== SENSITIVITY: W_COVERAGE_LOSS ===")
-    # Uses quick_seeds (not the full ABCD seed set) -- 8 weight values x 30
-    # seeds would be a lot of sims just for a sensitivity sweep. Widen this
-    # to `seeds` too once you're ready to report it in the thesis.
-    #
-    # NOTE (Aug 2026): sweep values are now relative-importance FRACTIONS
-    # (matching NORMALIZED_WEIGHTS' scale), not raw multipliers -- the old
-    # [5, 10, ..., 50] range was calibrated for the pre-fix raw-cost model
-    # and would be meaningless here. 0.1 = coverage barely matters,
-    # 0.8 = coverage dominates almost everything else in the ranking.
+   
     sens_results = run_sensitivity_analysis(
         "W_COVERAGE_LOSS",
         [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
