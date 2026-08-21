@@ -1,33 +1,15 @@
 # -*- coding: utf-8 -*-
-"""
-a21.py (Merged File: Ablation & Full PPS Comparison)
-════════════════════════════════════════════════════════════════════════
-FULL PPS FORMULA & ABLATION — SSE-only vs SSE+Gap vs SSE+PPS 
-(Combined a21.py and a22.py)
 
-This script tests the Persistent Patrol Scheduling (PPS) formulas.
-All three conditions use a20.PATROL_MODE:
-    "sse_only" -> no persistence signal at all (clean baseline)
-    "sse_gap"  -> validated condition (additive gap term)
-    "sse_pps"  -> full PPS: gap term + Mission Urgency (Threat x Age)
-
-This script runs the simulations, computes persistence metrics, performs
-paired Wilcoxon signed-rank tests, saves a CSV, and generates a 3-panel 
-zone-visit distribution bar chart.
-════════════════════════════════════════════════════════════════════════
-"""
 
 import csv
 import json
 import statistics
 
-import a20  # noqa: reuse the existing physics/grid/zone engine
+import a20  
 
 from scipy.stats import wilcoxon
 
-# ══════════════════════════════════════════════════════════════
-# PLOTTING SETUP
-# ══════════════════════════════════════════════════════════════
+
 _PLOTTING_AVAILABLE = False
 _HAS_GUI = False
 try:
@@ -56,8 +38,8 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════
 CONDITIONS = {
     "SSE_only": "sse_only",
-    "SSE_Gap":  "sse_gap",   # Gap term only
-    "SSE_PPS":  "sse_pps",   # Full PPS: Threat x Age
+    "SSE_Gap":  "sse_gap",   
+    "SSE_PPS":  "sse_pps",   
 }
 BASELINE = "SSE_only"
 HEAD_TO_HEAD = ("SSE_Gap", "SSE_PPS")
