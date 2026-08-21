@@ -1120,7 +1120,23 @@ HY_T3_DIST_W   = 0.05
 #                 staleness matter MORE for zones the game already
 #                 considers important, and matter LESS for low-value
 #                 zones -- i.e. persistence is prioritized, not uniform.
-PATROL_MODE  = "sse_gap"     # "sse_only" | "sse_gap" | "sse_pps"
+#   "gap_only" -- reviewer-check baseline: the SAME gap term as
+#                 "sse_gap" (HY_T2_GAP_W*tgap / tgap in tier3), but with
+#                 the HY_SSE_W*sse_zone_utility(...) game-theoretic term
+#                 removed from tier2/tier3 scoring entirely (see
+#                 _sse_term() at rank_zones' call site). Answers "is the
+#                 SSE game-theory term necessary, or does a plain
+#                 Age/Gap heuristic already capture the persistence
+#                 win?" Added after a 30-seed sweep found "gap_only" and
+#                 "sse_gap" produced bit-identical results -- this mode
+#                 didn't previously exist as a real, distinct code path;
+#                 any PATROL_MODE string other than "sse_only"/"sse_pps"
+#                 silently fell through to sse_gap's behavior. Confirmed
+#                 fixed: _persistence_terms() and _sse_term() are now
+#                 the only two places PATROL_MODE is branched on for
+#                 tier2/3 scoring, and _sse_term() is the one that
+#                 actually differs for "gap_only".
+PATROL_MODE  = "sse_gap"     # "sse_only" | "sse_gap" | "sse_pps" | "gap_only"
 COVERAGE_CURVE_SAMPLE_EVERY = 5   # steps between coverage-over-time samples
                                    # (Contribution 2 persistence figures)
 HY_URGENCY_W = 1.5           # weight for the Threat x Age interaction term, "sse_pps" mode only
@@ -1619,25 +1635,48 @@ def rank_zones(dr,dc,g,detected,step):
         per PATROL_MODE. urgency_term is the Mission Urgency = Threat x
         Age interaction (Threat = _threat_proxy(z), a floor-rescaled SSE
         value -- see note above; Age = the same normalized tgap the
-        gap_term already uses, no separate Age counter needed)."""
+        gap_term already uses, no separate Age counter needed).
+
+        NOTE: "sse_gap" and "gap_only" deliberately return the SAME
+        (gap_term, urgency_term) here -- gap_term=tgap, urgency_term=0
+        is correct for both, since neither mode uses the Mission-Urgency
+        interaction. That was never the bug. The bug (found via a
+        30-seed sweep: "gap_only" and "sse_gap" produced bit-identical
+        results on every seed/metric) was that score_t2/score_t3 below
+        added the HY_SSE_W*sse_zone_utility(...) game-theory term
+        UNCONDITIONALLY, regardless of PATROL_MODE -- so there was no
+        code path that actually removed the SSE term for "gap_only",
+        no matter what this function returned. Fixed below by gating
+        that term on PATROL_MODE != "gap_only"."""
         if PATROL_MODE == "sse_only":
             return 0.0, 0.0
         gap_term = i["tgap"]
         if PATROL_MODE == "sse_pps":
             urgency_term = HY_URGENCY_W * _threat_proxy(z) * i["tgap"]
-        else:  # "sse_gap"
+        else:  # "sse_gap" or "gap_only"
             urgency_term = 0.0
         return gap_term, urgency_term
+
+    def _sse_term(z):
+        """The game-theoretic SSE utility contribution to tier2/tier3
+        scoring. Zeroed out under "gap_only" -- that mode exists
+        specifically to answer "is the SSE game-theory term necessary,
+        or does a plain Age/Gap heuristic already capture the win?", so
+        it must actually be a pure gap/age scheduler with NO SSE signal,
+        not sse_gap under a different name."""
+        if PATROL_MODE == "gap_only":
+            return 0.0
+        return HY_SSE_W * sse_zone_utility(z, sse_cov, energy_hat)
 
     def score_t2(z,i):
         if USE_Q_LEARNING:
             return get_q_value(z, i, Q_WEIGHTS, sse_cov)
         gap_term, urgency_term = _persistence_terms(z, i)
         return (HY_T2_INCOMPL_W*i["incompl"] + HY_T2_GAP_W*gap_term + urgency_term + HY_T2_BORDER_W*i["border_pr"]
-                + HY_SSE_W*sse_zone_utility(z, sse_cov, energy_hat) + adapt_bonus(z) - HY_T2_DIST_W*i["travel"])
+                + _sse_term(z) + adapt_bonus(z) - HY_T2_DIST_W*i["travel"])
     def score_t3(z,i):
         gap_term, urgency_term = _persistence_terms(z, i)
-        return gap_term + urgency_term + HY_T3_BORDER_W*i["border_pr"] + HY_SSE_W*sse_zone_utility(z, sse_cov, energy_hat) + adapt_bonus(z) - HY_T3_DIST_W*i["travel"]
+        return gap_term + urgency_term + HY_T3_BORDER_W*i["border_pr"] + _sse_term(z) + adapt_bonus(z) - HY_T3_DIST_W*i["travel"]
 
     tier1.sort(key=lambda zi: -score_t1(zi[1]))
     tier2.sort(key=lambda zi: -score_t2(zi[0], zi[1]))
