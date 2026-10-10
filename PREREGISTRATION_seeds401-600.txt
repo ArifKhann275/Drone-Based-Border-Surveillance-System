@@ -1,0 +1,65 @@
+PRE-SPECIFICATION FOR THE CONFIRMATORY BLOCK (seeds 401-600)
+Policy I (absolute-scale RelayScore) vs. the other relay-selection policies
+
+Save this file unchanged BEFORE running anything on seeds 401-600, and commit it
+to git (or e-mail it to your supervisor) so that its date is recorded. Do not edit
+it after the first run. In the paper, say it is a time-stamped plan, not a public
+registration.
+
+1. WHY THIS BLOCK EXISTS
+   Policy I became the lead policy only after the fresh block (seeds 201-400) had
+   been analysed, and on the development block (seeds 1-50) I trailed D by 2.8
+   coverage points (q_BH = 0.058). Seeds 401-600 have not been used for any tuning,
+   design decision or analysis. They give a test of I that does not depend on the
+   earlier selection. [AUTHORS: confirm that seeds 401-600 were never used.]
+
+2. SETTING (identical to the headline condition)
+   Benapole Delta terrain, static wind, Np = 4, Nr = 4, 500 steps, theta = 0.5 for J.
+   No parameter of any policy is changed or re-tuned on this block. Weights and
+   prices are those already on disk: J (tuned weights of the paper),
+   tuned_T_lite.json, tuned_V_lite.json, tuned_AUC_lite.json (lambda = 1600),
+   tuned_I_lite.json, and the default RelayScore weights for C and I.
+
+3. POLICIES
+   Focal policy: I (default weights; no tuning).
+   Comparators: C, D, D2, T, V (untuned, D's weights), AUC (lambda = 1600),
+   B (nearest feasible), J.
+   Reported but not used to confirm or reject a hypothesis: T_tuned, V_tuned, BR,
+   I_lite.
+
+4. METRICS AND STATISTICS
+   Coverage (%), relay delay (steps), relay energy (%), seed-matched.
+   Differences: paired Wilcoxon, BH correction over all difference tests of the
+   hypotheses below. Equivalence: paired TOST, margin +/-2.0 coverage points
+   (the margin used on the fresh block, which is not derived from a mission
+   requirement), BH over the TOST tests. alpha = 0.05.
+
+5. HYPOTHESES
+   H1 (coverage equivalence). I's coverage is equivalent (TOST, +/-2.0) to that of
+       C, D, D2, T, V, AUC, B and J.
+   H2 (leanness vs. the untuned and auction comparators). I's relay delay and relay
+       energy are significantly lower than those of C, D, D2, T, V and AUC.
+   H3 (vs. J). I's relay delay and relay energy are not significantly higher than
+       J's.
+   Expected, not part of the confirmation (they were found on the fresh block and
+   are reported as such): I's coverage is not equivalent to T_tuned and V_tuned
+   (about 2.3-2.7 points lower); B has lower delay than I; BR has higher coverage
+   than I.
+
+6. DECISION RULES (fixed now)
+   - If H1, H2 and H3 all hold: report that the fresh-block finding for I was
+     confirmed on an independent block.
+   - If any single comparison in H1-H3 fails: report that comparison as failed,
+     name it in the abstract-level summary of the Results section, and weaken the
+     corresponding claim in the paper. Do not drop the comparison, change the
+     margin, change the policies, or re-select a block.
+   - If H1 fails for the comparators D or D2 (as it nearly did on the development
+     block): the paper must state that I's coverage equivalence to the FIS is not
+     confirmed.
+   - Results for I_lite, T_tuned, V_tuned, BR are exploratory and are labelled so.
+
+7. WHAT WILL BE REPORTED
+   The complete table produced by compare_focal_vs_all.py and the PASS/FAIL table
+   produced by confirmatory_report.py, whatever the outcome.
+
+Date written: ____________________      Authors: ____________________
