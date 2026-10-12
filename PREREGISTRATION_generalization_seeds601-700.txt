@@ -67,4 +67,4 @@ and e-mail the file to your supervisor. Do not edit the file after the first run
    The complete output of analyze_generalization.py (every cell, every comparator,
    every metric), whatever the outcome.
 
-Date written: ____________________      Authors: ____________________
+Date written: 3:30 PM 12 October 2026    Authors: Arif Khan, Mahmudul Hasan Khan
