@@ -1,0 +1,70 @@
+PRE-SPECIFICATION FOR THE GENERALIZATION SWEEP OF LARS (seeds 601-700)
+Terrain x wind sweep and fleet-size sweep
+
+STEP 1 (before running anything): fill in the date and names at the bottom, save the
+file unchanged, and RECORD A TIME STAMP that an outside party can check:
+    git add PREREGISTRATION_generalization_seeds601-700.txt
+    git commit -m "pre-specification for the generalization sweep (seeds 601-700)"
+    git log -1 --format="%H %ad" --date=iso      <- keep this output
+and e-mail the file to your supervisor. Do not edit the file after the first run.
+(Last time the commit failed because the folder was not a git repository; check that
+"git log" works before you start.)
+
+1. WHY
+   All headline and confirmatory results of the paper use one terrain (flat Benapole
+   Delta), static wind and N = 8 UAVs. The earlier sweeps compared Policy J with D on
+   the development block only. This sweep tests whether the LARS findings hold in
+   other terrains, other wind modes and other fleet sizes. Seeds 601-700 have not been
+   used for any tuning, design decision or analysis.
+   [AUTHORS: confirm that seeds 601-700 were never used.]
+
+2. DESIGN
+   Part A (terrain x wind): 4 terrains (benapole_delta, sylhet_hills, coxs_bazar,
+   chittagong_hill_tracts) x 3 wind modes (static, dynamic, stochastic) = 12 cells;
+   100 seeds per cell (601-700); default fleet Np = 4, Nr = 4; 500 steps.
+   Part B (fleet size): Benapole Delta, static wind; fleets (patrol x reserve) of
+   2x2, 3x3, 4x4, 6x6, 8x8 (N = 4, 6, 8, 12, 16); 100 seeds per size (601-700);
+   500 steps.
+   Policies in every cell: LARS (RelayScore with absolute-scale coverage loss and
+   default weights; Policy I in the code), C (RelayScore), D (true FIS), B (nearest
+   feasible), T_tuned (TOPSIS with the weights in tuned_T_lite.json).
+   No parameter of any policy is changed or re-tuned for any cell.
+
+3. METRICS AND STATISTICS
+   Coverage (%), relay delay (steps), relay energy (%), seed-matched within a cell.
+   Differences: paired Wilcoxon with Benjamini-Hochberg correction. Equivalence:
+   paired TOST, margin +/-2.0 coverage points (the margin used throughout the paper;
+   note that it is relatively large in cells with low coverage), BH over the TOST
+   tests. alpha = 0.05.
+
+4. HYPOTHESES (primary comparators: C and D)
+   G1 (coverage equivalence, terrain x wind). In every one of the 12 cells, LARS's
+      coverage is equivalent (TOST, +/-2.0) to that of C and to that of D.
+      Family: 24 TOST tests.
+   G2 (leanness, terrain x wind). In every cell, LARS's relay delay and relay energy
+      are significantly lower than those of C and of D. Family: 48 tests
+      (12 cells x 2 comparators x 2 metrics).
+   G3 (fleet size). At every fleet size N = 4, 6, 8, 12, 16, LARS's coverage is
+      equivalent to that of C and D (family: 10 TOST tests), and its relay delay and
+      energy are significantly lower than those of C and D (family: 20 tests).
+   Reported but not used to confirm or reject (exploratory): comparisons with B and
+   T_tuned; all other metrics.
+
+5. DECISION RULES (fixed now)
+   - A hypothesis counts as confirmed only if EVERY test in its family passes. For
+     each hypothesis report the number of passing tests (for example "11 of 12 cells")
+     and name every failing cell, comparator and metric, with its effect size.
+   - A cell in which LARS is significantly WORSE than C or D on delay or energy is
+     reported as a counter-example in the Results section, not in an appendix.
+   - Do not drop cells, change the margin, change the policies or seeds, or re-run
+     with other seeds after seeing results. If a run crashes, re-run the same cell
+     with the same seeds.
+   - If G1 fails in the hilly terrains, state that LARS's coverage equivalence does
+     not extend to them; if G2 fails in a cell, state that LARS's delay/energy
+     advantage does not hold there.
+
+6. WHAT WILL BE REPORTED
+   The complete output of analyze_generalization.py (every cell, every comparator,
+   every metric), whatever the outcome.
+
+Date written: ____________________      Authors: ____________________
