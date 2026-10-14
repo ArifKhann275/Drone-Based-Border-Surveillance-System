@@ -1,0 +1,49 @@
+sweep,condition,metric,policy,j_mean,d_mean,p,q_bh,survives_bh
+terrain_wind,benapole_delta/static,coverage_pct,J,90.568,90.732,0.6401155087870462,0.766502,False
+terrain_wind,benapole_delta/static,avg_relay_delay_steps,J,13.4575,14.5201,0.008333363871146915,0.033309,True
+terrain_wind,benapole_delta/static,avg_relay_energy_pct,J,9.8756,11.8374,6.010637926934237e-06,4.1e-05,True
+terrain_wind,benapole_delta/dynamic,coverage_pct,J,89.532,91.678,0.18438303383713672,0.354015,False
+terrain_wind,benapole_delta/dynamic,avg_relay_delay_steps,J,13.1405,14.9887,1.0451820186219152e-05,6.3e-05,True
+terrain_wind,benapole_delta/dynamic,avg_relay_energy_pct,J,9.3305,12.7948,1.1297758276218413e-07,1e-06,True
+terrain_wind,benapole_delta/stochastic,coverage_pct,J,92.028,92.5,0.8018176049348754,0.87471,False
+terrain_wind,benapole_delta/stochastic,avg_relay_delay_steps,J,13.2346,15.2797,4.028586058524297e-06,3.9e-05,True
+terrain_wind,benapole_delta/stochastic,avg_relay_energy_pct,J,9.4781,13.2925,5.610267805877811e-11,0.0,True
+terrain_wind,sylhet_hills/static,coverage_pct,J,32.818,32.586,0.4800079423257866,0.658297,False
+terrain_wind,sylhet_hills/static,avg_relay_delay_steps,J,6.6874,6.7203,0.08428387967828298,0.224757,False
+terrain_wind,sylhet_hills/static,avg_relay_energy_pct,J,39.2866,39.5711,0.33053567270784123,0.547094,False
+terrain_wind,sylhet_hills/dynamic,coverage_pct,J,31.88,31.806,0.6907081048211274,0.789381,False
+terrain_wind,sylhet_hills/dynamic,avg_relay_delay_steps,J,6.9093,6.8594,0.2598350470503199,0.461929,False
+terrain_wind,sylhet_hills/dynamic,avg_relay_energy_pct,J,43.7641,43.6178,0.39806292572561963,0.616355,False
+terrain_wind,sylhet_hills/stochastic,coverage_pct,J,39.856,38.888,0.07819937207358135,0.220798,False
+terrain_wind,sylhet_hills/stochastic,avg_relay_delay_steps,J,7.4753,7.4418,0.15736966684793852,0.328424,False
+terrain_wind,sylhet_hills/stochastic,avg_relay_energy_pct,J,39.4216,39.3599,0.8627958052262049,0.920316,False
+terrain_wind,coxs_bazar/static,coverage_pct,J,49.278,48.072,0.0555078526098741,0.166524,False
+terrain_wind,coxs_bazar/static,avg_relay_delay_steps,J,10.3411,10.5152,0.050249617470759234,0.160799,False
+terrain_wind,coxs_bazar/static,avg_relay_energy_pct,J,39.2325,39.6652,0.5965744241177723,0.766502,False
+terrain_wind,coxs_bazar/dynamic,coverage_pct,J,47.772,45.986,0.00902128880451463,0.033309,True
+terrain_wind,coxs_bazar/dynamic,avg_relay_delay_steps,J,10.9625,10.9296,0.7508770436579908,0.838188,False
+terrain_wind,coxs_bazar/dynamic,avg_relay_energy_pct,J,38.3622,39.1976,0.2306647717207464,0.425843,False
+terrain_wind,coxs_bazar/stochastic,coverage_pct,J,51.148,50.606,0.41154000529653956,0.61731,False
+terrain_wind,coxs_bazar/stochastic,avg_relay_delay_steps,J,11.4799,11.6045,0.4577098934125028,0.658297,False
+terrain_wind,coxs_bazar/stochastic,avg_relay_energy_pct,J,37.0615,37.7403,0.13120449683862312,0.286264,False
+terrain_wind,chittagong_hill_tracts/static,coverage_pct,J,35.26,35.992,0.011494244344739429,0.039409,True
+terrain_wind,chittagong_hill_tracts/static,avg_relay_delay_steps,J,7.7872,7.972,0.0010356813035458734,0.005524,True
+terrain_wind,chittagong_hill_tracts/static,avg_relay_energy_pct,J,38.0883,39.6246,0.003378854437718857,0.016219,True
+terrain_wind,chittagong_hill_tracts/dynamic,coverage_pct,J,36.252,35.506,0.1191013693626469,0.272232,False
+terrain_wind,chittagong_hill_tracts/dynamic,avg_relay_delay_steps,J,8.5677,8.4139,0.11281874216705877,0.270765,False
+terrain_wind,chittagong_hill_tracts/dynamic,avg_relay_energy_pct,J,38.8137,39.2492,0.11281874216705877,0.270765,False
+terrain_wind,chittagong_hill_tracts/stochastic,coverage_pct,J,39.228,39.828,0.46924695798400995,0.658297,False
+terrain_wind,chittagong_hill_tracts/stochastic,avg_relay_delay_steps,J,8.8238,8.8012,0.31271939666259707,0.53609,False
+terrain_wind,chittagong_hill_tracts/stochastic,avg_relay_energy_pct,J,38.4229,38.4276,0.6105888230253922,0.766502,False
+fleet_size,"N=2 (patrol=1,reserve=1)",coverage_pct,J,51.302,51.302,1.0,1.0,False
+fleet_size,"N=2 (patrol=1,reserve=1)",avg_relay_delay_steps,J,29.2407,29.2407,1.0,1.0,False
+fleet_size,"N=2 (patrol=1,reserve=1)",avg_relay_energy_pct,J,18.6693,18.6693,1.0,1.0,False
+fleet_size,"N=4 (patrol=2,reserve=2)",coverage_pct,J,67.932,67.106,0.17139359052950254,0.342787,False
+fleet_size,"N=4 (patrol=2,reserve=2)",avg_relay_delay_steps,J,20.247,20.167,0.5766138649393062,0.766502,False
+fleet_size,"N=4 (patrol=2,reserve=2)",avg_relay_energy_pct,J,14.2935,14.8123,0.3717929849795193,0.594869,False
+fleet_size,"N=8 (patrol=4,reserve=4)",coverage_pct,J,90.568,90.732,0.6401155087870462,0.766502,False
+fleet_size,"N=8 (patrol=4,reserve=4)",avg_relay_delay_steps,J,13.4575,14.5201,0.008333363871146915,0.033309,True
+fleet_size,"N=8 (patrol=4,reserve=4)",avg_relay_energy_pct,J,9.8756,11.8374,6.010637926934237e-06,4.1e-05,True
+fleet_size,"N=16 (patrol=8,reserve=8)",coverage_pct,J,99.994,99.998,0.6547208460185769,0.766502,False
+fleet_size,"N=16 (patrol=8,reserve=8)",avg_relay_delay_steps,J,10.9942,14.7238,1.7763568394002505e-15,0.0,True
+fleet_size,"N=16 (patrol=8,reserve=8)",avg_relay_energy_pct,J,7.1793,11.5753,1.7763568394002505e-15,0.0,True

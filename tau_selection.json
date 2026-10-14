@@ -1,0 +1,19 @@
+{
+  "rule": {
+    "cost_margin": 0.1,
+    "min_gain": 0.5,
+    "reference": "J training means"
+  },
+  "training": {
+    "seed_start": 101,
+    "seeds": 50,
+    "J": {
+      "cov": 92.266,
+      "delay": 13.327659999999998,
+      "energy": 9.5943
+    }
+  },
+  "tau_b": null,
+  "tau_d": null,
+  "tau_j": null
+}

@@ -1,0 +1,21 @@
+Pre-registration Plan: Multi-Objective Tuning Generalization
+Block: Seeds 701–900 (n=200)
+Environment: Benapole Delta, static wind, N_p = 4, N_r = 4 (N=8 total).
+
+Background:
+In earlier exploratory blocks, TOPSIS and VIKOR tuned solely for coverage (T-tuned, V-tuned) achieved higher coverage than LARS but at a severe cost to relay delay and energy, primarily by exhausting idle reserves (reserve-first behavior). This block tests whether this difference is an artifact of the single-objective tuning.
+
+Policies Tested:
+1. C (RelayScore baseline, default weights)
+2. D (True FIS baseline)
+3. LARS_MO (LARS tuned on a combined multi-objective cost: coverage + delay + energy)
+4. T_MO (TOPSIS tuned on the same multi-objective cost)
+5. V_MO (VIKOR tuned on the same multi-objective cost)
+
+Hypothesis (H4):
+When tuned on a balanced multi-objective cost rather than coverage alone, TOPSIS (T_MO) and VIKOR (V_MO) will shift away from reserve-first behavior. Their delay and energy will significantly decrease compared to their coverage-only tuned versions, and their coverage will drop to a level statistically equivalent (TOST margin ±2.0) to LARS_MO. LARS_MO will maintain a non-dominated trade-off point (lowest energy).
+
+Decision Rules:
+- Paired Wilcoxon signed-rank tests for delay and energy (alpha = 0.05, BH corrected).
+- Paired TOST for coverage equivalence (margin ±2.0 points).
+- If T_MO and V_MO's coverage falls to LARS's level while improving delay/energy, we conclude that their previous coverage advantage was an artifact of the single-objective tuning ignoring transit costs.

@@ -1,0 +1,15 @@
+{
+    "policy": "V",
+    "weights": {
+        "distance": 0.3039831535688827,
+        "battery_margin": 0.1663081430541235,
+        "coverage_loss": 0.015216304962639572,
+        "relay_delay": 0.5144923984143542
+    },
+    "train_cov": 92.118,
+    "train_dly": 11.999619999999998,
+    "train_eng": 9.955359999999999,
+    "multi_obj_cost": 18.859490000000005,
+    "nfev": 416,
+    "seconds": 66251.0
+}

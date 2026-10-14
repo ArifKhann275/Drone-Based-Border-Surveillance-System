@@ -1,0 +1,90 @@
+{
+  "policy": "AUC",
+  "lam": 1600.0,
+  "selection_rule": "max mean training coverage over the grid; ties -> smaller lam",
+  "train_seeds": [
+    101,
+    150
+  ],
+  "grid": [
+    {
+      "lam": 0.0,
+      "train_cov": 89.65,
+      "train_delay": 13.591020000000004,
+      "train_energy": 8.84256
+    },
+    {
+      "lam": 5.0,
+      "train_cov": 90.27,
+      "train_delay": 13.35654,
+      "train_energy": 8.62646
+    },
+    {
+      "lam": 10.0,
+      "train_cov": 90.242,
+      "train_delay": 13.417220000000002,
+      "train_energy": 8.71006
+    },
+    {
+      "lam": 25.0,
+      "train_cov": 90.154,
+      "train_delay": 13.931180000000001,
+      "train_energy": 9.03346
+    },
+    {
+      "lam": 50.0,
+      "train_cov": 90.176,
+      "train_delay": 14.59914,
+      "train_energy": 9.60686
+    },
+    {
+      "lam": 100.0,
+      "train_cov": 90.28200000000001,
+      "train_delay": 15.376219999999998,
+      "train_energy": 10.375
+    },
+    {
+      "lam": 200.0,
+      "train_cov": 90.42999999999998,
+      "train_delay": 16.27982,
+      "train_energy": 11.30672
+    },
+    {
+      "lam": 400.0,
+      "train_cov": 91.116,
+      "train_delay": 17.2049,
+      "train_energy": 12.314919999999999
+    },
+    {
+      "lam": 800.0,
+      "train_cov": 91.958,
+      "train_delay": 17.72422,
+      "train_energy": 12.704959999999998
+    },
+    {
+      "lam": 1600.0,
+      "train_cov": 92.05799999999999,
+      "train_delay": 17.8537,
+      "train_energy": 12.79674
+    },
+    {
+      "lam": 3200.0,
+      "train_cov": 91.772,
+      "train_delay": 17.959220000000002,
+      "train_energy": 13.08494
+    },
+    {
+      "lam": 6400.0,
+      "train_cov": 90.638,
+      "train_delay": 18.10818,
+      "train_energy": 13.16864
+    },
+    {
+      "lam": 1000000.0,
+      "train_cov": 90.34999999999998,
+      "train_delay": 18.75786,
+      "train_energy": 13.933300000000001
+    }
+  ],
+  "grid_extension_note": "Original grid ended at lam=400 with coverage still rising; extended on the training block only (seeds 101-150) with the same selection rule."
+}

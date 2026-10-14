@@ -1,0 +1,27 @@
+{
+  "policy": "Policy I (Multi-Objective Tuned)",
+  "tuned_weights": {
+    "W_TRAVEL_ENERGY": 0.3363118629984942,
+    "W_COVERAGE_LOSS": 0.00630677730847746,
+    "W_RELAY_DELAY": 0.6573813596930284
+  },
+  "base_weights": {
+    "W_TRAVEL_ENERGY": 0.35,
+    "W_COVERAGE_LOSS": 0.4,
+    "W_RELAY_DELAY": 0.25
+  },
+  "tune_seeds": [
+    101,
+    150
+  ],
+  "test_seeds": [
+    1,
+    50
+  ],
+  "tuning_cost": 0.2524956666666667,
+  "tuning_metrics": {
+    "coverage": 91.12,
+    "delay": 11.648960000000002,
+    "energy": 8.88168
+  }
+}

@@ -1,0 +1,18 @@
+{
+    "policy": "I",
+    "weights": {
+        "W_TRAVEL_ENERGY": 0.04680636580318917,
+        "W_COVERAGE_LOSS": 0.6523152053083494,
+        "W_RELAY_DELAY": 0.3008784288884614
+    },
+    "train_cov": 91.63200000000002,
+    "nfev": 312,
+    "popsize": 8,
+    "maxiter": 12,
+    "de_seed": 42,
+    "train_seeds": [
+        101,
+        150
+    ],
+    "seconds": 44309.1
+}

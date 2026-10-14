@@ -1,0 +1,14 @@
+{
+    "policy": "LARS",
+    "weights": {
+        "W_TRAVEL_ENERGY": 0.210673966739359,
+        "W_COVERAGE_LOSS": 0.1526015779046151,
+        "W_RELAY_DELAY": 0.636724455356026
+    },
+    "train_cov": 91.62200000000001,
+    "train_dly": 11.754180000000003,
+    "train_eng": 9.29678,
+    "multi_obj_cost": 18.903479999999988,
+    "nfev": 312,
+    "seconds": 54171.3
+}

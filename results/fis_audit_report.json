@@ -1,0 +1,136 @@
+{
+  "section_a": {
+    "legacy": {
+      "counts": {
+        "LOW": 19,
+        "MEDIUM": 43,
+        "HIGH": 19
+      },
+      "eps": 0.07692307692307687
+    },
+    "expert": {
+      "counts": {
+        "LOW": 33,
+        "MEDIUM": 33,
+        "HIGH": 15
+      },
+      "eps": -0.25,
+      "fingerprint": "0986f1cf8dcbe208d5408f67eab347169217db05",
+      "is_weighted_sum": false
+    },
+    "indep": {
+      "counts": {
+        "LOW": 37,
+        "MEDIUM": 29,
+        "HIGH": 15
+      },
+      "eps": -0.25,
+      "fingerprint": "1ce41e5f9dc40ce82c2c674a3136d5a838199b42",
+      "is_weighted_sum": false
+    },
+    "certificate": {
+      "why": "midpoint rated HIGH while both endpoints are below HIGH",
+      "A": [
+        "LOW",
+        "FAR",
+        "LOW",
+        "SHORT"
+      ],
+      "cA": "LOW",
+      "B": [
+        "HIGH",
+        "NEAR",
+        "HIGH",
+        "SHORT"
+      ],
+      "cB": "MEDIUM",
+      "C": [
+        "MEDIUM",
+        "MEDIUM",
+        "MEDIUM",
+        "SHORT"
+      ],
+      "cC": "HIGH"
+    }
+  },
+  "section_b": {
+    "orientation": "ok",
+    "monotonicity": {
+      "battery_margin": {
+        "direction": "increasing",
+        "max_violation": 3.350578898676247
+      },
+      "distance": {
+        "direction": "decreasing",
+        "max_violation": 2.3090459697381505
+      },
+      "coverage_loss": {
+        "direction": "decreasing",
+        "max_violation": 1.9180089177329336
+      },
+      "relay_delay": {
+        "direction": "decreasing",
+        "max_violation": 2.021423508344
+      }
+    },
+    "expert": {
+      "n": 600,
+      "max_abs_err": 1.2789769243681803e-13,
+      "rmse": 4.4565438262918846e-14,
+      "mean_abs_err": 3.590609291374373e-14
+    },
+    "indep": {
+      "n": 600,
+      "max_abs_err": 1.2789769243681803e-13,
+      "rmse": 4.538861124999064e-14,
+      "mean_abs_err": 3.623767952376511e-14
+    }
+  },
+  "section_c": {
+    "fis_vectorized_us": 242.45894997147843,
+    "weighted_sum_us": 3.146599978208542,
+    "d2_lut_us": 98.86535000987351,
+    "fis_skfuzzy_us": 303579.2216677995
+  },
+  "section_d": [
+    {
+      "terms": 2,
+      "R": 16,
+      "us_per_call": 349.3329166667536
+    },
+    {
+      "terms": 3,
+      "R": 81,
+      "us_per_call": 415.18724998847273
+    },
+    {
+      "terms": 4,
+      "R": 256,
+      "us_per_call": 806.6634999704547
+    },
+    {
+      "terms": 5,
+      "R": 625,
+      "us_per_call": 543.5310000514922
+    },
+    {
+      "terms": 6,
+      "R": 1296,
+      "us_per_call": 428.3804999431595
+    },
+    {
+      "terms": 8,
+      "R": 4096,
+      "us_per_call": 585.8854998950846
+    },
+    {
+      "terms": 10,
+      "R": 10000,
+      "us_per_call": 694.8014994850382
+    },
+    {
+      "fit_intercept_us": 501.41232646474697,
+      "fit_slope_us_per_rule": 0.019175069074357155
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+    "policy": "AUC",
+    "lam": 5,
+    "train_cov": 90.27,
+    "train_dly": 13.35654,
+    "train_eng": 8.62646,
+    "multi_obj_cost": 20.721500000000006,
+    "seconds": 278.6
+}

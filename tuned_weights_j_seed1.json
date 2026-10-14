@@ -1,0 +1,35 @@
+{
+  "policy": "J (full) = H battery fix + I coverage fix + VIKOR-style Q",
+  "tuned_weights": {
+    "W_TRAVEL_ENERGY": 0.22426480664958148,
+    "W_COVERAGE_LOSS": 0.06681214395800097,
+    "W_RELAY_DELAY": 0.5019690680430083,
+    "W_BATTERY_MARGIN": 0.20695398134940912
+  },
+  "theta": 0.5,
+  "theta_tuned": false,
+  "battery_margin_saturation_pct": 25.0,
+  "coverage_loss_saturation_ceiling": 0.6,
+  "tune_seeds": [
+    101,
+    150
+  ],
+  "tune_steps": 500,
+  "test_seeds": [
+    1,
+    50
+  ],
+  "fleet": {
+    "num_drones": 4,
+    "num_reserves": 4
+  },
+  "optimizer": {
+    "method": "scipy.optimize.differential_evolution",
+    "popsize": 8,
+    "maxiter": 12,
+    "evaluations": 316,
+    "elapsed_s": 41643.4,
+    "seed": 1
+  },
+  "tuning_objective_value_mean_coverage_pct": 91.88600000000001
+}

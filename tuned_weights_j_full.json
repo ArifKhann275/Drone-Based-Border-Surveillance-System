@@ -1,0 +1,33 @@
+{
+  "policy": "J (full) = H battery fix + I coverage fix + VIKOR-style Q (Multi-Objective Tuned)",
+  "tuned_weights": {
+    "W_TRAVEL_ENERGY": 0.41089036621184083,
+    "W_COVERAGE_LOSS": 0.07778616245683836,
+    "W_RELAY_DELAY": 0.49556026258654373,
+    "W_BATTERY_MARGIN": 0.015763208744777126
+  },
+  "theta": 0.5,
+  "theta_tuned": false,
+  "tuning_cost": 0.41984750000000004,
+  "tuning_metrics": {
+    "coverage": 43.26,
+    "delay": 8.333400000000001,
+    "energy": 5.3362
+  },
+  "tune_seeds": [
+    101,
+    105
+  ],
+  "test_seeds": [
+    1,
+    50
+  ],
+  "optimizer": {
+    "method": "scipy.optimize.differential_evolution",
+    "popsize": 12,
+    "maxiter": 2,
+    "evaluations": 112,
+    "elapsed_s": 255.1,
+    "seed": 0
+  }
+}

@@ -1,0 +1,19 @@
+{
+    "policy": "T",
+    "weights": {
+        "distance": 0.13187233549667846,
+        "battery_margin": 0.6769750816465165,
+        "coverage_loss": 0.050800202774351426,
+        "relay_delay": 0.1403523800824535
+    },
+    "train_cov": 94.184,
+    "nfev": 416,
+    "popsize": 8,
+    "maxiter": 12,
+    "de_seed": 42,
+    "train_seeds": [
+        101,
+        150
+    ],
+    "seconds": 51978.2
+}

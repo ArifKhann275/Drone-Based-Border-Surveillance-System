@@ -1,0 +1,32 @@
+{
+  "policy": "Policy I (Single-Objective Tuned: Coverage)",
+  "tuned_weights": {
+    "W_TRAVEL_ENERGY": 0.2386430204827954,
+    "W_COVERAGE_LOSS": 0.13254292305288234,
+    "W_RELAY_DELAY": 0.6288140564643223
+  },
+  "base_weights": {
+    "W_TRAVEL_ENERGY": 0.35,
+    "W_COVERAGE_LOSS": 0.4,
+    "W_RELAY_DELAY": 0.25
+  },
+  "tune_seeds": [
+    101,
+    150
+  ],
+  "test_seeds": [
+    1,
+    50
+  ],
+  "tuning_metrics": {
+    "coverage": 91.51000000000002
+  },
+  "optimizer": {
+    "method": "scipy.optimize.differential_evolution",
+    "popsize": 12,
+    "maxiter": 25,
+    "evaluations": 267,
+    "elapsed_s": 70663.9,
+    "seed": 0
+  }
+}

@@ -1,0 +1,3393 @@
+# -*- coding: utf-8 -*-
+
+import math
+import random
+import statistics
+import csv
+import json
+import time  # NEW: wall-clock timing instrumentation for relay_selector calls
+from copy import deepcopy
+from functools import partial
+
+# Plotting libraries for decision breakdown
+try:
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")  # headless-safe: only ever savefig(), never show()
+    import matplotlib.pyplot as plt
+except ImportError:
+    print("Warning: pandas or matplotlib not installed. Plotting will be skipped.")
+
+import a20  # noqa: reuse the existing physics/grid/zone engine as-is
+
+from scipy.stats import wilcoxon, ttest_rel, rankdata
+
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════
+NUM_DRONES = 4                  # simultaneously-patrolling drones (fixed, matches a20.STATIONS)
+RESERVE_POOL_SIZE = 4           # extra idle spare drones (one pre-positioned per station)
+RELAY_SAFETY_FLOOR = 8.0       # % battery a candidate must keep in reserve after the trip
+COVERAGE_STALENESS_CAP_STEPS = 200   # same normalization a20.zone_info() uses (tgap)
+THREAT_ZONE_PENALTY = 2.0      # penalty multiplier if a threat zone is left unattended
+PRIORITY_ZONE_WEIGHT = 1.0     # weight for border priority
+
+# Utility-function weights (Moved to a dictionary for Sensitivity Analysis)
+DEFAULT_WEIGHTS = {
+    # All three terms are costs to the mission. Battery is NOT a soft utility
+    # benefit anymore: feasibility is enforced as a hard constraint in
+    # _feasibility(), which prevents travel energy from being double-counted
+    # through both "battery margin" and "energy cost".
+    "W_TRAVEL_ENERGY": 1.0,      # travel energy from a20 OWT-A* model, in battery-% equivalent
+    "W_COVERAGE_LOSS": 25.0,     # marginal surveillance-staleness cost, normalized to [0,1]
+    "W_RELAY_DELAY": 0.4,        # small delay penalty, measured in simulation steps
+}
+
+# ── Policy D: fuzzy multi-attribute relay selection ─────────────────────
+# Attribute weights for select_fuzzy_relay(). These are NOT the same kind
+# of object as DEFAULT_WEIGHTS (raw cost multipliers) -- they are relative
+# IMPORTANCE weights (should sum to ~1.0) applied AFTER each attribute has
+# already been fuzzy-normalized onto a common [0,1] membership scale, per
+# the fuzzy-optimum-selection method the paper cites. See select_fuzzy_relay()
+# docstring for the fidelity caveat versus the original paper's own 4
+# UAV-alternative attributes (which require a continuous-space RF/
+# k-connectivity model this codebase does not implement).
+FUZZY_ATTR_WEIGHTS = {
+    "distance": 0.30,        # analogue of the paper's link/hop-distance attribute
+    "battery_margin": 0.30,  # analogue of the paper's energy/endurance attribute
+    "coverage_loss": 0.25,   # analogue of the paper's mission-payoff attribute
+    "relay_delay": 0.15,     # analogue of the paper's latency attribute
+}
+
+# ── Policy C: RelayScore weights, APPLIED TO POOL-NORMALIZED ATTRIBUTES ──
+# BUG FIX (Aug 2026): DEFAULT_WEIGHTS above multiplies RAW, physically-unit-ed
+# costs together (travel_energy in battery-%, coverage_loss in [0, ~0.03],
+# relay_delay in steps). Empirically, travel_energy sits in the 5-15 range
+# while 25*coverage_loss only reaches ~0.1-0.75 -- so coverage_loss ended up
+# contributing under ~5% of total_cost even with W_COVERAGE_LOSS=25, and
+# RelayScore's ranking collapsed to "cheapest energy + shortest delay",
+# almost completely ignoring the coverage term its own docstring claims to
+# optimize. This was confirmed on real run data: RelayScore's chosen
+# candidates had ~6x HIGHER avg_relay_coverage_gap than fuzzy MADM's, despite
+# fuzzy MADM giving coverage only 25% importance vs RelayScore's intended
+# dominant weighting.
+#
+# FIX: normalize travel_energy / coverage_loss / relay_delay onto a common
+# [0,1] "how good is this candidate on this attribute, relative to the other
+# feasible candidates right now" scale -- the SAME normalization step
+# select_fuzzy_relay() (Policy D) already uses via _fuzzy_normalize() --
+# BEFORE applying importance weights. See _relay_utility_pool(). These
+# weights now mean RELATIVE IMPORTANCE (should sum to ~1.0), exactly like
+# FUZZY_ATTR_WEIGHTS, NOT raw cost multipliers.
+NORMALIZED_WEIGHTS = {
+    "W_TRAVEL_ENERGY": 0.35,
+    "W_COVERAGE_LOSS": 0.40,
+    "W_RELAY_DELAY": 0.25,
+}
+
+# Policy G's weights (see "POLICY G" section below): same 3 attributes as
+# NORMALIZED_WEIGHTS, PLUS a genuine ranked battery_margin term -- not just
+# the feasibility-gate use battery_margin already has in every other
+# policy (RELAY_SAFETY_FLOOR cutoff in _feasibility()). fuzzy MADM (D)
+# ranks candidates by battery_margin already (see select_fuzzy_relay's
+# batt_r term); RelayScore (C/E/F) never did. This is the concrete,
+# code-level structural difference identified as the likely driver of
+# D's coverage_pct/mission_completed advantage over C, F.
+NORMALIZED_WEIGHTS_G = {
+    "W_TRAVEL_ENERGY": 0.30,
+    "W_COVERAGE_LOSS": 0.30,
+    "W_RELAY_DELAY": 0.20,
+    "W_BATTERY_MARGIN": 0.20,
+}
+
+# ── Policy G's failure mode, and the fix (Policy H) ─────────────────────
+# DIAGNOSED BUG in Policy G: _fuzzy_normalize(battery_margin, higher_is_
+# better=True) gives an UNBOUNDED reward for having more headroom. An
+# idle-reserve candidate's battery_margin is always ~100% (it hasn't
+# flown), so whenever a reserve is in the feasible pool it deterministically
+# WINS the battery_margin membership term (batt_r=1.0) every single time --
+# a guaranteed +W_BATTERY_MARGIN boost no patrol candidate, however close
+# or cheap, can ever match. Empirically (30-seed / 1000-step validation)
+# this caused "relay starvation" in ~13% of seeds: G kept picking distant,
+# high-battery reserves over close, cheap patrol candidates, so completed
+# relay cycles per run dropped sharply (e.g. 8-26 vs baseline C's 34-38),
+# each individual relay got MORE expensive (higher delay, higher energy),
+# and in 2 of those seeds mission_completed flipped to False. This is the
+# SAME structural bias previously diagnosed for coverage_loss defaulting
+# to 0.0 for idle-reserve candidates in _coverage_loss_for_candidate(),
+# just recurring on a second attribute.
+#
+# THE FIX (Policy H, below): _fuzzy_normalize() ranks candidates
+# RELATIVE TO WHICHEVER OTHERS ARE IN THE POOL RIGHT NOW -- with a common
+# 2-candidate pool, that means whoever has more margin gets full credit
+# (1.0) and the other gets none (0.0), NO MATTER HOW SMALL OR LARGE THE
+# ACTUAL GAP IS. So Policy H does NOT reuse pool-relative normalization
+# for battery_margin at all -- it scores battery standing on a FIXED,
+# ABSOLUTE scale anchored to two physically meaningful reference points:
+# RELAY_SAFETY_FLOOR (0% credit -- the hard feasibility edge every
+# candidate must already clear) and this saturation point (100% credit --
+# "comfortably safe", extra margin beyond this earns nothing more). A
+# candidate's battery credit is now judged against that fixed yardstick,
+# not against whichever 1-2 other candidates happen to also be feasible
+# this step -- so a patrol drone with a genuinely adequate (not huge)
+# margin gets meaningful partial credit instead of a hard zero just
+# because a full-battery idle reserve also happened to be in the pool.
+# 25 percentage points above RELAY_SAFETY_FLOOR (8%) is used as
+# "comfortably safe" -- roughly 3x the mandatory safety reserve, a
+# domain-assumption constant that should be justified/cited the same way
+# the other hand-set constants in this file are.
+BATTERY_MARGIN_SATURATION_PCT = 25.0
+
+NORMALIZED_WEIGHTS_H = dict(NORMALIZED_WEIGHTS_G)  # same weights as G on purpose --
+# isolates the saturation-cap fix's own effect from any weight retuning.
+
+
+# ══════════════════════════════════════════════════════════════
+# FLEET INITIALIZATION
+# ══════════════════════════════════════════════════════════════
+def _new_drone(idx, seed):
+    r, c = a20.STATIONS[idx % len(a20.STATIONS)]
+    start_r, start_c = (1, 1) if (r, c) == (0, 0) else \
+                        (1, a20.COLS - 2) if (r, c) == (0, a20.COLS - 1) else \
+                        (a20.ROWS - 2, 1) if (r, c) == (a20.ROWS - 1, 0) else \
+                        (a20.ROWS - 2, a20.COLS - 2)
+    return {
+        "id": idx,
+        "home_station": (r, c),
+        "r": start_r, "c": start_c, "pr": None, "pc": None,
+        "battery": 100.0,
+        "cycles": 0,                # completed full-recharge count, feeds SOH aging model
+                                     # (a20.USE_SOH_AGING) -- per-DRONE, not fleet-wide, so a
+                                     # drone that has cycled through many relief trips ages
+                                     # independently of its fleet-mates
+        "target_zone": None, "target_cell": None,
+        "zone_rng": random.Random(seed * 97 + idx * 31 + 17),
+        "role": "patrol",          # patrol | relay_incoming | returning
+        "rendezvous_id": None,     # which drone id this one is relaying toward (if relay_incoming)
+        "awaiting_relay": False,   # True once this drone has flagged low battery and a relay is inbound
+        "return_target": None,    # station coords this drone heads to when role == returning
+        "relay_episode_counted": False,  # True once this low-battery episode has already
+                                          # incremented relay_requested (see step_fleet());
+                                          # reset when the episode is resolved so the NEXT
+                                          # low-battery episode can be counted separately.
+    }
+
+
+def init_fleet(seed, num_drones=NUM_DRONES, num_reserves=RESERVE_POOL_SIZE):
+    g = a20.make_grid(seed)
+    a20.place_threats(seed, [g])
+    drones = [_new_drone(i, seed) for i in range(num_drones)]
+    for d in drones:
+        d["role"] = "patrol"
+
+    for j in range(num_reserves):
+        idx = num_drones + j
+        st = a20.STATIONS[j % len(a20.STATIONS)]
+        rd = _new_drone(idx, seed)
+        rd["r"], rd["c"] = st       
+        rd["role"] = "idle_reserve"
+        rd["home_station"] = st
+        drones.append(rd)
+
+    return {
+        "g": g,
+        "detected": set(),
+        "drones": drones,
+        "step": 0,
+        "RC": 0,          
+        "target_patrol_count": num_drones,   
+        "log": [],
+        "first_all_threats_step": None,   # step at which len(detected) first reached NUM_THREATS
+        "first_full_coverage_step": None, # step at which coverage_pct(g) first reached 100
+        "relay_requested": 0,   # incremented ONCE per low-battery episode (see step_fleet())
+        "relay_fulfilled": 0,   # incremented every time a feasible candidate was actually found
+        "total_energy_consumed": 0.0,   # running sum of EVERY FINITE step-cost across ALL
+                                         # drones, NEVER reset by recharge -- a true total-work
+                                         # metric, mirrors a20.DroneSimHeadless's own
+                                         # self.s_energy pattern.
+        "stranded_events": 0,   # count of steps where calculate_actual_step_cost() returned
+                                 # float('inf') (required airspeed exceeded the drone's hardware
+                                 # cap under stochastic wind -- see a20.owt_wind_cost()). These
+                                 # are intentionally EXCLUDED from total_energy_consumed instead
+                                 # of being added (which would make the running total permanently
+                                 # inf), mirroring a20.DroneSimHeadless._track_energy().
+
+        # NEW: real wall-clock cost of the relay_selector() function itself,
+        # accumulated across every relay-selection EVENT in this mission.
+        # This is the ONLY metric in this codebase that measures algorithmic
+        # runtime (as opposed to mission-outcome quantities like
+        # avg_relay_delay_steps, which measures how many SIMULATION STEPS
+        # pass before a relay physically arrives -- a consequence of WHICH
+        # candidate was chosen, not of how long it took to choose it).
+        "selector_time_total_s": 0.0,
+        "selector_calls": 0,
+        # NEW: every individual call's elapsed time (seconds), not just the
+        # running sum. A single anomalous call (OS scheduling pause, disk
+        # I/O stall, or -- for the fuzzy FIS selector specifically -- a
+        # cold first-call cache/rule-graph build that happens to land
+        # inside a timed mission instead of before it) can otherwise blow
+        # up a whole seed's avg_selector_time_ms even though every OTHER
+        # call in that seed was normal. Keeping the raw samples lets
+        # collect_metrics() report a median/trimmed-mean alongside the
+        # mean, so one bad call doesn't corrupt a runtime claim.
+        "selector_time_samples_s": [],
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════
+# RELAYSCORE — the 5-factor utility function
+# ══════════════════════════════════════════════════════════════
+def _manhattan(r1, c1, r2, c2):
+    return abs(r1 - r2) + abs(c1 - c2)
+
+
+def _safe_wilcoxon(x, y):
+    """Paired Wilcoxon helper that avoids scipy warnings on all-zero differences
+    and returns a stable, JSON-friendly result.
+
+    Catches broadly (not just ValueError): environments with a mismatched
+    numpy/scipy pair (e.g. numpy>=2.0 with an old scipy build) can raise
+    AttributeError/TypeError deep inside scipy's wilcoxon() rather than a
+    clean ValueError. A single metric failing to get a p-value should not
+    crash a 30-seed thesis run -- it should just report wilcoxon_p=None
+    for that metric and let everything else continue. If you see
+    "wilcoxon_p": None everywhere, run `pip install --upgrade scipy numpy`
+    to fix the real underlying cause rather than relying on this fallback.
+
+    Booleans (e.g. mission_completed: True/False) are coerced to 0/1
+    before any subtraction/stats -- numpy refuses to subtract two boolean
+    arrays directly ("use bitwise_xor instead"), which would otherwise
+    crash BOTH wilcoxon() and the ttest_rel() fallback on this metric.
+    """
+    pairs = [(int(a) if isinstance(a, bool) else a, int(b) if isinstance(b, bool) else b)
+             for a, b in zip(x, y)
+             if isinstance(a, (int, float, bool)) and isinstance(b, (int, float, bool))]
+    if len(pairs) < 2:
+        return {"mean_diff": None, "wilcoxon_p": None}
+    diffs = [b - a for a, b in pairs]
+    mean_diff = statistics.mean(diffs)
+    if all(abs(d) < 1e-12 for d in diffs):
+        return {"mean_diff": mean_diff, "wilcoxon_p": 1.0}
+    try:
+        _stat, p = wilcoxon([a for a, _ in pairs], [b for _, b in pairs])
+        return {"mean_diff": mean_diff, "wilcoxon_p": round(float(p), 5)}
+    except Exception as e:
+        # Common cause: numpy>=2.0 paired with a scipy build too old to
+        # support it -- wilcoxon()'s internal error-handling path itself
+        # crashes (AttributeError on np.AxisError) before it can even
+        # return a real statistical result. ttest_rel() runs through a
+        # different scipy code path and is usually unaffected, so fall
+        # back to a paired t-test rather than silently losing the
+        # significance test entirely. Flagged via "test_used" so it's
+        # clear in the output which test actually produced the p-value.
+        try:
+            _stat2, p2 = ttest_rel([a for a, _ in pairs], [b for _, b in pairs])
+            return {"mean_diff": mean_diff, "wilcoxon_p": round(float(p2), 5),
+                     "test_used": "ttest_rel_fallback",
+                     "wilcoxon_error": f"{type(e).__name__}: {e}"}
+        except Exception as e2:
+            return {"mean_diff": mean_diff, "wilcoxon_p": None,
+                     "wilcoxon_error": f"{type(e).__name__}: {e}",
+                     "ttest_error": f"{type(e2).__name__}: {e2}"}
+
+
+def _rank_biserial_paired(x, y):
+    """Matched-pairs rank-biserial correlation for two paired samples --
+    same convention/formula as Relay_System.py's _rank_biserial_paired(),
+    duplicated here (rather than imported) to avoid a circular import
+    (Relay_System.py already imports FROM this module). r = (sum of
+    |diff|-ranks favoring x - sum favoring y) / total rank sum. Range
+    [-1, 1]; sign matches whether x tends to exceed y (+) or fall short
+    of y (-). Returns None if every pair is tied or too few pairs exist.
+    Booleans are coerced to 0/1, matching _safe_wilcoxon's convention."""
+    pairs = [(int(a) if isinstance(a, bool) else a, int(b) if isinstance(b, bool) else b)
+             for a, b in zip(x, y)
+             if isinstance(a, (int, float, bool)) and isinstance(b, (int, float, bool))]
+    diffs = [a - b for a, b in pairs if a != b]
+    if not diffs:
+        return None
+    abs_diffs = [abs(d) for d in diffs]
+    ranks = rankdata(abs_diffs)
+    pos = sum(r for r, d in zip(ranks, diffs) if d > 0)
+    neg = sum(r for r, d in zip(ranks, diffs) if d < 0)
+    total = pos + neg
+    if total == 0:
+        return 0.0
+    return round(float((pos - neg) / total), 4)
+
+
+def _feasibility(candidate, needer):
+    """Weight-INDEPENDENT feasibility check, shared by both B (nearest) and
+    C (RelayScore) so a candidate that can't physically make the trip is
+    excluded from BOTH policies' candidate pools identically. Returns
+    (travel_energy, battery_margin, is_feasible)."""
+    travel_energy = a20.energy_to_travel(candidate["r"], candidate["c"],
+                                          needer["r"], needer["c"])
+    battery_margin = candidate["battery"] - travel_energy - RELAY_SAFETY_FLOOR
+    return travel_energy, battery_margin, battery_margin >= 0
+
+
+def _candidate_pool(needer, drones):
+    """
+    Return all role-eligible relay candidates.
+
+    Eligible:
+      - active patrol drones
+      - idle reserve drones
+
+    Excluded:
+      - the drone requesting the relay
+      - drones already assigned to another relay
+      - drones already returning to a station
+      - malformed entries that do not contain required fleet fields
+    """
+    if needer is None or drones is None:
+        return []
+
+    pool = []
+
+    for d in drones:
+        if not isinstance(d, dict):
+            continue
+
+        if "id" not in d or "role" not in d:
+            continue
+
+        # A drone cannot relay for itself.
+        if d["id"] == needer.get("id"):
+            continue
+
+        # Only patrol or idle-reserve drones can be dispatched.
+        if d["role"] not in ("patrol", "idle_reserve"):
+            continue
+
+        # Defensive guard: never reuse a drone already committed to another relay.
+        if d.get("awaiting_relay", False):
+            continue
+
+        pool.append(d)
+
+    return pool
+
+
+def _feasible_candidate_pool(needer, drones):
+    """
+    Shared feasible candidate pool for both B and C.
+
+    B = nearest feasible candidate.
+    C = highest RelayScore among the exact same feasible candidates.
+
+    This isolates the relay-selection/ranking rule in the B-vs-C comparison.
+    """
+    if needer is None or drones is None:
+        return []
+
+    pool = []
+
+    for d in _candidate_pool(needer, drones):
+        try:
+            travel_energy, battery_margin, feasible = _feasibility(d, needer)
+        except (KeyError, TypeError, ValueError):
+            # Ignore malformed candidate state instead of crashing the whole run.
+            continue
+
+        if feasible:
+            pool.append((d, travel_energy, battery_margin))
+
+    return pool
+
+
+def _coverage_loss_for_candidate(candidate, needer, g, detected, step, relay_delay):
+    """Estimate the candidate-induced marginal surveillance-staleness cost.
+
+    This is intentionally a conservative lower-bound estimate:
+      projected_staleness - current_staleness
+    over the relay-arrival interval only.
+
+    It does NOT assume what happens after the relay arrives, nor does it
+    simulate the counterfactual patrol trajectory of the candidate. Those
+    assumptions are documented as a modeling limitation in the thesis.
+    """
+    if candidate["role"] == "idle_reserve":
+        return 0.0, 0.0, 0.0, None
+
+    if candidate["target_zone"] is None:
+        return 0.0, 0.0, 0.0, None
+
+    info = a20.zone_info(
+        candidate["target_zone"][0],
+        candidate["target_zone"][1],
+        0, 0, g, detected, step
+    )
+    if not info:
+        return 0.0, 0.0, 0.0, None
+
+    cap = max(float(COVERAGE_STALENESS_CAP_STEPS), 1.0)
+    current_tgap = min(info["raw_gap"] / cap, 1.0)
+    projected_tgap = min((info["raw_gap"] + relay_delay) / cap, 1.0)
+    marginal_loss = max(0.0, projected_tgap - current_tgap)
+
+    # Threat / border priority can increase the mission impact of leaving a
+    # strategically important zone unattended. These fields already exist in
+    # a20.zone_info(), so no extra "ground truth" state is invented here.
+    has_threat = bool(info.get("has_threat", False))
+    border_pr = float(info.get("border_pr", 0.0))
+    penalty_mult = 1.0
+    if has_threat:
+        penalty_mult += THREAT_ZONE_PENALTY
+    penalty_mult += PRIORITY_ZONE_WEIGHT * border_pr
+
+    weighted_loss = marginal_loss * penalty_mult
+    return weighted_loss, marginal_loss, current_tgap, {
+        "has_threat": has_threat,
+        "border_priority": border_pr,
+        "penalty_multiplier": round(penalty_mult, 3),
+        "current_tgap": round(current_tgap, 3),
+        "projected_tgap": round(projected_tgap, 3),
+    }
+
+
+def relay_score(candidate, needer, g, detected, step, weights=None):
+    """Compute mission utility for one feasible relay candidate.
+
+    CONCEPTUAL FIX:
+      Battery is a HARD FEASIBILITY CONSTRAINT:
+          battery - travel_energy >= RELAY_SAFETY_FLOOR
+
+      Once feasible, battery surplus is NOT added as a soft benefit because
+      that would partially count travel energy twice through:
+          (battery - travel_energy) + travel_energy_cost.
+
+    Therefore the utility is:
+        RS_i = -(w_E * E_i + w_C * L_i + w_D * D_i)
+
+    where E_i is physics-based travel energy, L_i is marginal surveillance
+    staleness cost, and D_i is relay arrival delay.
+
+    Larger score is better (less negative cost).
+    """
+    if weights is None:
+        weights = DEFAULT_WEIGHTS
+
+    dist = _manhattan(candidate["r"], candidate["c"], needer["r"], needer["c"])
+    travel_energy, battery_margin, feasible = _feasibility(candidate, needer)
+
+    if not feasible:
+        return None, {
+            "candidate_id": candidate["id"],
+            "reason": "insufficient_battery",
+            "battery_margin": round(battery_margin, 2),
+            "score": None,
+        }
+
+    relay_delay = dist
+
+    coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+        candidate, needer, g, detected, step, relay_delay
+    )
+
+    energy_cost = weights["W_TRAVEL_ENERGY"] * travel_energy
+    coverage_cost = weights["W_COVERAGE_LOSS"] * coverage_loss
+    delay_cost = weights["W_RELAY_DELAY"] * relay_delay
+    total_cost = energy_cost + coverage_cost + delay_cost
+
+    # Higher is better. Zero is the theoretical cost of a perfect
+    # zero-energy/zero-delay/zero-impact relay, which is unattainable.
+    score = -total_cost
+
+    diag = {
+        "candidate_id": candidate["id"],
+        "role": candidate["role"],
+        "distance": dist,
+        "travel_energy": round(travel_energy, 3),
+        "battery_margin": round(battery_margin, 2),  # feasibility/headroom only
+        "battery_feasible": True,
+        "coverage_loss": round(coverage_loss, 6),
+        "raw_marginal_coverage_loss": round(raw_marginal_loss, 6),
+        "current_tgap": round(current_tgap, 6),
+        "relay_delay": relay_delay,
+        "energy_cost": round(energy_cost, 3),
+        "coverage_cost": round(coverage_cost, 3),
+        "delay_cost": round(delay_cost, 3),
+        "score": round(score, 3),
+        "coverage_metadata": cov_meta,
+    }
+    return score, diag
+
+
+def _relay_utility_pool(feasible, needer, g, detected, step, weights=None):
+    """Rank ALL feasible candidates together using POOL-NORMALIZED attributes,
+    so no single term's raw physical scale (e.g. travel_energy's battery-%
+    units vs coverage_loss's [0,1] fraction) can silently dominate the
+    ranking regardless of the configured weight -- see NORMALIZED_WEIGHTS
+    docstring above for the bug this fixes.
+
+    Mirrors select_fuzzy_relay()'s normalization step (_fuzzy_normalize),
+    but keeps RelayScore's own weighted-SUM utility form (as opposed to
+    fuzzy's weighted distance-to-ideal-point), so Policy C and Policy D
+    remain a fair, like-for-like comparison: same candidate pool, same
+    normalized attributes, different combination rule.
+
+    Returns a list of (candidate, utility, diag) sorted best-first.
+    Higher utility is better (1.0 = candidate is best-on-every-attribute).
+    """
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS
+
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": travel_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0, "membership_delay": 1.0,
+            "score": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    # Lower raw value = better on every one of these three attributes.
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        # Each membership term is already "1.0 = best candidate on this
+        # attribute", so a plain weighted SUM is the utility -- higher is
+        # better, same "bigger score wins" convention the old relay_score()
+        # used, just no longer vulnerable to raw-unit scale mismatch.
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i])
+
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay(needer, drones, g, detected, step, weights=None):
+    """Proposed policy: highest mission-utility candidate from the SAME
+    feasible candidate pool used by the nearest baseline.
+
+    FIXED (Aug 2026): ranking now uses POOL-NORMALIZED attributes via
+    _relay_utility_pool() instead of raw physical-unit costs, so
+    travel_energy's larger raw magnitude can no longer silently swamp
+    coverage_loss's contribution to the ranking. Pass weights=DEFAULT_WEIGHTS
+    (or any dict with the old raw-cost semantics) only if you specifically
+    want the old, scale-mismatched behavior for a regression comparison --
+    normal use should leave weights=None (-> NORMALIZED_WEIGHTS).
+    """
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool(feasible, needer, g, detected, step, weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY G — BATTERY-MARGIN-AWARE RELAYSCORE (adds a genuine ranked
+# battery_margin term on top of the pool-normalization fix C already
+# has, NOT a replacement for it)
+# ══════════════════════════════════════════════════════════════
+# WHY THIS EXISTS: comparing C's and D's (fuzzy MADM) candidate-scoring
+# code side by side shows a real structural gap, not just a weight-
+# percentage difference. In _relay_utility_pool() (Policy C), battery
+# margin is computed but only ever used as a hard feasibility CUTOFF in
+# _feasibility()/_feasible_candidate_pool() (must be >=0 to even enter
+# the pool) -- see the "feasibility/headroom only" comment on that field.
+# Once a candidate clears that bar, C's ranking never looks at battery
+# margin again, so a candidate with 0.5% headroom and one with 40%
+# headroom are equally attractive to C if their energy/coverage/delay
+# numbers are similar. select_fuzzy_relay() (Policy D), by contrast,
+# ranks candidates by battery_margin directly (its own batt_r fuzzy-
+# membership term). That is a plausible mechanism for D building up a
+# healthier fleet over time (fewer near-critical-battery drones later
+# on) and, indirectly, better mission_completed / coverage_pct -- see
+# the C-vs-D run_six_way_comparison() diagnostic this was built from.
+# Policy G tests that hypothesis directly: same pool-normalized utility
+# form as C (NOT copying D's fuzzy TOPSIS-style distance metric), same
+# 3 attributes, PLUS a 4th ranked attribute for battery_margin.
+def _relay_utility_pool_g(feasible, needer, g, detected, step, weights=None):
+    """Mirrors _relay_utility_pool() exactly (same feasible pool, same
+    coverage-loss computation, same weighted-SUM combination rule),
+    adding ONE new ranked attribute: battery_margin (higher = better,
+    fuzzy-normalized across the candidate pool exactly like the other
+    three). Everything else is identical to C on purpose, so any
+    difference in outcome vs C isolates the battery-margin term's own
+    effect."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS_G
+
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": travel_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0,
+            "membership_delay": 1.0, "membership_battery": 1.0,
+            "score": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    # Lower raw value = better for these three; higher raw value = better
+    # for battery_margin (more headroom is always preferable), so it gets
+    # higher_is_better=True while the other three keep higher_is_better=False.
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+    batt_r = _fuzzy_normalize([r["battery_margin"] for r in rows], higher_is_better=True)
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i]
+                   + w["W_BATTERY_MARGIN"] * batt_r[i])
+
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "membership_battery": round(batt_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_battery_aware(needer, drones, g, detected, step, weights=None):
+    """Policy G: RelayScore + a genuine ranked battery_margin attribute
+    (see the section docstring above for why this is a structurally
+    different addition from Policy E's reweighting or Policy F's
+    prediction, and what specific C-vs-D code gap it targets). Compare
+    against C (isolates the battery-margin term's own effect), D (does
+    battery-awareness alone close the fuzzy-MADM gap?), and F (battery-
+    awareness vs prediction -- which refinement earns its complexity?)."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_g(feasible, needer, g, detected, step, weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY H — BATTERY-MARGIN-AWARE RELAYSCORE, SATURATION-CAPPED (fixes
+# the relay-starvation failure mode diagnosed in Policy G)
+# ══════════════════════════════════════════════════════════════
+def _relay_utility_pool_h(feasible, needer, g, detected, step, weights=None):
+    """Identical to _relay_utility_pool_g() (same feasible pool, same
+    energy/coverage/delay computation, same weighted-SUM combination),
+    with exactly ONE change: battery_margin uses an ABSOLUTE-scale
+    membership (anchored to RELAY_SAFETY_FLOOR / BATTERY_MARGIN_SATURATION_PCT)
+    instead of G's pool-relative fuzzy-normalize. See
+    BATTERY_MARGIN_SATURATION_PCT's docstring above for why pool-relative
+    normalization can't be fixed by capping alone in the common 2-candidate
+    case, and why this specific fix addresses Policy G's diagnosed
+    relay-starvation failure mode."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS_H
+
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": travel_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0,
+            "membership_delay": 1.0, "membership_battery": 1.0,
+            "score": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+    # THE FIX -- and why it must be ABSOLUTE-scale, not just capped-then-
+    # pool-relative: _fuzzy_normalize() is a min-max normalization WITHIN
+    # THE CURRENT POOL, so with only 2 feasible candidates (the common
+    # case), whichever one has more margin gets membership=1.0 and the
+    # other gets 0.0 REGARDLESS OF HOW BIG THE GAP ACTUALLY IS -- capping
+    # the raw value first doesn't fix this, because min-max normalization
+    # only cares about relative rank between whatever candidates are
+    # present, not the magnitude of separation between them. (This is the
+    # exact same pool-relative-instability failure mode diagnosed earlier
+    # for Policy D.) So battery_margin gets an ABSOLUTE-scale membership
+    # instead, anchored to two fixed, physically meaningful reference
+    # points: RELAY_SAFETY_FLOOR (0% credit -- the hard feasibility edge)
+    # and BATTERY_MARGIN_SATURATION_PCT (100% credit -- "comfortably
+    # safe", no further reward beyond this). A candidate's battery
+    # standing is now judged against this fixed yardstick, not against
+    # whichever 1-2 other candidates happened to also be feasible this
+    # step -- so a patrol drone with genuinely-adequate-but-not-huge
+    # margin (say 15%) gets meaningful partial credit instead of a hard
+    # 0.0 just because an idle reserve with 92% happened to also be in
+    # the pool.
+    batt_span = max(BATTERY_MARGIN_SATURATION_PCT - RELAY_SAFETY_FLOOR, 1e-9)
+    batt_r = [
+        max(0.0, min(1.0, (r["battery_margin"] - RELAY_SAFETY_FLOOR) / batt_span))
+        for r in rows
+    ]
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i]
+                   + w["W_BATTERY_MARGIN"] * batt_r[i])
+
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "battery_margin_capped": round(min(r["battery_margin"], BATTERY_MARGIN_SATURATION_PCT), 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "membership_battery": round(batt_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_battery_aware_capped(needer, drones, g, detected, step, weights=None):
+    """Policy H: Policy G with the battery_margin saturation-cap fix.
+    Compare against G (isolates the fix's own effect -- same weights,
+    same everything else) and C (does fixed battery-awareness beat plain
+    RelayScore once the starvation bug is gone?)."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_h(feasible, needer, g, detected, step, weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY I — COVERAGE-MARGIN-AWARE RELAYSCORE (same fix APPLIED TO A
+# DIFFERENT ATTRIBUTE: coverage_loss instead of battery_margin)
+# ══════════════════════════════════════════════════════════════
+# WHY THIS EXISTS: run_topsis_vikor_comparison() (Section V-I) showed that
+# TOPSIS and VIKOR -- ranking the SAME 3 attributes as C, with the SAME
+# relative weights, just a different aggregation rule -- do NOT carry C's
+# significant coverage_pct/avg_zone_staleness_steps deficit against D in
+# the paper's headline condition (Benapole delta, static wind): T-vs-D
+# and V-vs-D are both n.s. on coverage and staleness, while C-vs-D is
+# significant (coverage p=0.028, medium effect; staleness r=-0.88, LARGE
+# effect). Since T/V and C score the exact same underlying data, the gap
+# is not evidence against linear scalarization as a class -- it points at
+# something specific to C's own _relay_utility_pool() implementation.
+#
+# The most direct structural candidate: _fuzzy_normalize() is a min-max
+# normalization WITHIN THE CURRENT FEASIBLE POOL -- exactly the same
+# pool-relative-instability failure mode already diagnosed and fixed for
+# battery_margin in Policy G -> H above (see BATTERY_MARGIN_SATURATION_PCT's
+# docstring). With the common 2-candidate pool, coverage_loss is subject
+# to the identical problem: whichever candidate has the smaller marginal
+# staleness cost gets membership_coverage=1.0 and the other gets 0.0, NO
+# MATTER HOW TINY OR HUGE the actual gap is -- so a candidate causing a
+# genuinely severe staleness spike can still get full coverage credit
+# just because its only rival that step happened to be even worse. This
+# is speculative diagnosis until tested -- Policy I exists to test it
+# directly, in isolation from every other fix (G/H's battery term is NOT
+# included here, so any change in coverage_pct/staleness can be
+# attributed to this one normalization change alone).
+#
+# THE FIX (mirrors Policy H's pattern exactly, applied to coverage_loss
+# instead of battery_margin): score coverage_loss on a FIXED, ABSOLUTE
+# scale anchored to two reference points instead of pool-relative
+# min-max. 0.0 (no marginal staleness cost at all) earns full credit;
+# COVERAGE_LOSS_SATURATION_CEILING and above earns zero credit, with
+# linear credit in between -- judged against this fixed yardstick, not
+# against whichever 1-2 other candidates happen to also be feasible this
+# step.
+COVERAGE_LOSS_SATURATION_CEILING = 0.06
+# Reuses the exact same practical ceiling policy_d_true_fis.py's own
+# fuzzy-membership universe already uses for this attribute
+# (COVERAGE_LOSS_UNIVERSE = np.linspace(0, 0.06, 121)) rather than
+# introducing a second, inconsistent domain assumption -- coverage_loss
+# values from real runs cluster well inside this range (see
+# terrain_wind_generalization.csv), and 0.06 was itself chosen there to
+# span that observed range with headroom, not picked ad hoc for Policy I.
+
+NORMALIZED_WEIGHTS_I = dict(NORMALIZED_WEIGHTS)  # SAME weights as C, on
+# purpose -- isolates the normalization fix's own effect from any weight
+# retuning, exactly like NORMALIZED_WEIGHTS_H reusing G's weights.
+
+
+def _relay_utility_pool_i(feasible, needer, g, detected, step, weights=None):
+    """Identical to _relay_utility_pool() (same feasible pool, same
+    energy/coverage/delay computation, same weighted-SUM combination),
+    with exactly ONE change: coverage_loss uses an ABSOLUTE-scale
+    membership (anchored to 0.0 / COVERAGE_LOSS_SATURATION_CEILING)
+    instead of the pool-relative _fuzzy_normalize(). See Policy I's
+    section docstring above for why this specific fix was chosen."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS_I
+
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": travel_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0, "membership_delay": 1.0,
+            "score": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+    # THE FIX: coverage_loss scored against a fixed absolute yardstick
+    # instead of min-max'd within the current pool. Lower coverage_loss
+    # is better, so (unlike battery_margin's fix) the credit direction is
+    # INVERTED: 0.0 raw loss -> 1.0 credit, >=ceiling raw loss -> 0.0
+    # credit.
+    cov_span = max(COVERAGE_LOSS_SATURATION_CEILING, 1e-9)
+    cov_r = [
+        max(0.0, min(1.0, 1.0 - (r["coverage_loss"] / cov_span)))
+        for r in rows
+    ]
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i])
+
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "coverage_loss_capped": round(min(r["coverage_loss"], COVERAGE_LOSS_SATURATION_CEILING), 6),
+            "raw_marginal_coverage_loss": round(r["raw_marginal_loss"], 6),
+            "current_tgap": round(r["current_tgap"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_coverage_aware(needer, drones, g, detected, step, weights=None):
+    """Policy I: Policy C (RelayScore) with ONLY the coverage_loss
+    normalization changed from pool-relative to absolute-scale -- see
+    the Policy I section docstring above (right before
+    _relay_utility_pool_i()) for the full diagnosis and reasoning.
+    Compare against C (isolates this fix's own effect -- same weights,
+    same energy/delay handling, same everything else) and D (does this
+    close C's headline coverage_pct/avg_zone_staleness_steps deficit?)."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_i(feasible, needer, g, detected, step, weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY E — DYNAMIC-WEIGHT RELAYSCORE (context-aware refinement on top
+# of the pool-normalization fix, NOT a replacement for it)
+# ══════════════════════════════════════════════════════════════
+# Tunable pressure thresholds. Kept as module-level constants (like
+# RELAY_SAFETY_FLOOR etc. above) so they show up in one obvious place for
+# sensitivity analysis, rather than being buried as magic numbers.
+COVERAGE_PRESSURE_THRESHOLD = 0.5   # mean zone staleness / cap, above which
+                                      # W_COVERAGE_LOSS starts getting boosted
+COVERAGE_PRESSURE_MAX_BOOST = 2.0    # multiplier applied at pressure == 1.0
+BATTERY_CRITICAL_MARGIN = 5.0        # % headroom above RELAY_SAFETY_FLOOR,
+                                      # below which W_TRAVEL_ENERGY starts
+                                      # getting boosted
+BATTERY_CRITICAL_MAX_BOOST = 2.5     # multiplier applied at zero headroom
+
+
+def _dynamic_weights(needer, g, step, base_weights=None,
+                      coverage_pressure_threshold=COVERAGE_PRESSURE_THRESHOLD,
+                      coverage_pressure_max_boost=COVERAGE_PRESSURE_MAX_BOOST,
+                      battery_critical_margin=BATTERY_CRITICAL_MARGIN,
+                      battery_critical_max_boost=BATTERY_CRITICAL_MAX_BOOST):
+    """Compute a FRESH set of normalized-importance weights for one decision,
+    based on current mission pressure:
+
+      - COVERAGE PRESSURE: if the whole map's mean zone staleness (relative
+        to the same COVERAGE_STALENESS_CAP_STEPS cap _coverage_loss_for_
+        candidate() uses) is already high, boost W_COVERAGE_LOSS -- the
+        fleet is falling behind on surveillance overall, so this decision
+        should weigh coverage more heavily than usual.
+
+      - BATTERY PRESSURE: if the NEEDER's own battery headroom above
+        RELAY_SAFETY_FLOOR is small, boost W_TRAVEL_ENERGY -- a
+        battery-critical needer can't afford an energy-expensive relay
+        choice, regardless of what that choice would do for coverage.
+
+    Both boosts are linear ramps from 1.0x (at the threshold) up to their
+    max at the extreme (pressure=1.0 / headroom=0), so the effect is
+    continuous rather than a hard on/off switch. Weights are renormalized
+    to sum to 1.0 afterward, so they stay directly comparable in scale to
+    NORMALIZED_WEIGHTS and to each other.
+
+    NOTE: this is deliberately a SEPARATE function from _relay_utility_pool's
+    normalization step. Attribute normalization (fixing the scale-mismatch
+    bug) and importance re-weighting (this function, an optional refinement)
+    are two different concerns -- keeping them separate means either one can
+    be turned off/ablated independently when writing up the comparison.
+    """
+    w = dict(base_weights or NORMALIZED_WEIGHTS)
+
+    # ── Coverage pressure: mean zone staleness across the WHOLE map, not
+    # just this one candidate's marginal effect -- a global signal that
+    # _relay_utility_pool()'s per-decision normalization has no visibility
+    # into, since that only compares candidates against each other.
+    staleness_values = [step - c["last_visited_step"] for c in g.values()
+                         if not c.get("is_station")]
+    if staleness_values:
+        cap = max(float(COVERAGE_STALENESS_CAP_STEPS), 1.0)
+        coverage_pressure = min(statistics.mean(staleness_values) / cap, 1.0)
+    else:
+        coverage_pressure = 0.0
+
+    if coverage_pressure > coverage_pressure_threshold:
+        span = max(1.0 - coverage_pressure_threshold, 1e-9)
+        ramp = (coverage_pressure - coverage_pressure_threshold) / span
+        boost = 1.0 + (coverage_pressure_max_boost - 1.0) * ramp
+        w["W_COVERAGE_LOSS"] *= boost
+
+    # ── Battery pressure: how close THIS needer is to the hard feasibility
+    # floor right now, independent of which candidate ends up chosen.
+    battery_headroom = needer.get("battery", 100.0) - RELAY_SAFETY_FLOOR
+    if battery_headroom < battery_critical_margin:
+        deficit = max(0.0, battery_critical_margin - battery_headroom)
+        ramp = min(deficit / battery_critical_margin, 1.0)
+        boost = 1.0 + (battery_critical_max_boost - 1.0) * ramp
+        w["W_TRAVEL_ENERGY"] *= boost
+
+    total = sum(w.values())
+    if total > 0:
+        w = {k: v / total for k, v in w.items()}
+    return w
+
+
+def select_best_relay_dynamic(needer, drones, g, detected, step, weights=None,
+                               coverage_pressure_threshold=COVERAGE_PRESSURE_THRESHOLD,
+                               coverage_pressure_max_boost=COVERAGE_PRESSURE_MAX_BOOST,
+                               battery_critical_margin=BATTERY_CRITICAL_MARGIN,
+                               battery_critical_max_boost=BATTERY_CRITICAL_MAX_BOOST):
+    """Policy E: RelayScore with dynamic (state-dependent) importance
+    weights, computed fresh for every decision via _dynamic_weights().
+
+    This is Policy C PLUS one more layer -- it still uses the SAME feasible
+    candidate pool and the SAME pool-normalization step (_relay_utility_pool)
+    that fixed the original scale-mismatch bug. Only the importance weights
+    handed to that normalization step change, based on current coverage
+    pressure and the needer's battery state. Compare against Policy C
+    (static-normalized weights) to isolate the marginal value of the
+    dynamic layer specifically.
+    """
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    dyn_weights = _dynamic_weights(
+        needer, g, step, base_weights=weights,
+        coverage_pressure_threshold=coverage_pressure_threshold,
+        coverage_pressure_max_boost=coverage_pressure_max_boost,
+        battery_critical_margin=battery_critical_margin,
+        battery_critical_max_boost=battery_critical_max_boost,
+    )
+    scored = _relay_utility_pool(feasible, needer, g, detected, step, dyn_weights)
+    best_cand, _best_score, _best_diag = scored[0]
+    diags = [diag for _, _, diag in scored]
+    for diag in diags:
+        diag["dynamic_weights_used"] = {k: round(v, 3) for k, v in dyn_weights.items()}
+    return best_cand, diags
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY F — PREDICTIVE RELAYSCORE (future-wind energy + predicted
+# coverage loss, on top of the SAME pool-normalization fix C/D/E share)
+# ══════════════════════════════════════════════════════════════
+# WHY THIS EXISTS: oracle-knowledge instrumentation (perfect future wind,
+# no forecast error) found that swapping in ARRIVAL-TIME travel energy
+# alone flips the full weighted decision in 3.9% of cases (7/180, 10
+# seeds x 500 steps). Extending coverage-loss projection an additional
+# PREDICTIVE_COVERAGE_HORIZON steps past arrival roughly DOUBLES that to
+# 6.7% (12/180) -- meaningfully bigger than anything the dynamic-weight
+# reweighting layer (Policy E) achieved (0/172, and only 2/172 even under
+# an artificial 10x boost). That is the empirical basis for building this
+# as a real policy rather than another reweighting variant.
+#
+# IMPLEMENTATION NOTE -- "prediction" here is EXACT, not a forecast model:
+# a20.py's dynamic wind (get_current_wind()) is a deterministic, smooth,
+# closed-form function of the step counter (see a20.py's wind-dynamics
+# section) with NO random/noisy component. So "predicting" wind H steps
+# ahead is just evaluating that same known function at a future step --
+# there is no forecast error to model, and no separate predictor needs to
+# be trained. This is the same technique the oracle-validation test used;
+# Policy F simply uses it as the ACTUAL decision rule instead of only a
+# diagnostic. (If a20.py's wind model is ever changed to include genuine
+# stochastic noise, this stops being exact and would need a real
+# short-horizon forecaster -- flagged here so that assumption doesn't go
+# stale silently.)
+PREDICTIVE_COVERAGE_HORIZON = 30   # steps beyond arrival to project zone
+                                     # staleness forward. NEEDS TUNING via
+                                     # tune_predictive_horizon() below on a
+                                     # TRAIN seed set before trusting a
+                                     # reported result -- 30 is only the
+                                     # value used in the diagnostic above,
+                                     # not a validated choice.
+
+
+def _predicted_travel_energy(candidate, needer, step):
+    """Travel energy using wind AT THE CANDIDATE'S ESTIMATED ARRIVAL STEP
+    (step + Manhattan distance) instead of wind AT THE CURRENT STEP. Exact
+    (not approximate) because a20's dynamic wind is a deterministic
+    function of step -- see module docstring above.
+
+    If a20.WIND_DYNAMIC_ENABLED is False, get_current_wind() returns the
+    same static values regardless of which step is asked for, so this
+    transparently degrades to being identical to the current-wind energy
+    (Policy F reduces to Policy C's energy term with no special-casing
+    needed here).
+    """
+    dist = _manhattan(candidate["r"], candidate["c"], needer["r"], needer["c"])
+    saved_step = a20._SIM_CLOCK["step"]
+    try:
+        a20._SIM_CLOCK["step"] = step + dist
+        energy = a20.energy_to_travel(candidate["r"], candidate["c"], needer["r"], needer["c"])
+    finally:
+        a20._SIM_CLOCK["step"] = saved_step   # ALWAYS restore, even on exception
+    return energy
+
+
+def _predicted_coverage_loss_for_candidate(candidate, needer, g, detected, step, relay_delay,
+                                             horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Same idea as _coverage_loss_for_candidate(), but projects the
+    candidate's currently-claimed zone's staleness `horizon` steps further
+    than just the relay-arrival window -- representing that the borrowed
+    patrol drone won't be back to that zone for a while after the swap,
+    not just during the trip itself.
+
+    Idle reserves and candidates with no target_zone still return 0.0,
+    exactly like the non-predictive version (they aren't abandoning any
+    patrol assignment either way, so there's nothing to project forward).
+    """
+    if candidate["role"] == "idle_reserve" or candidate["target_zone"] is None:
+        return 0.0, 0.0, 0.0, None
+
+    info = a20.zone_info(candidate["target_zone"][0], candidate["target_zone"][1],
+                          0, 0, g, detected, step)
+    if not info:
+        return 0.0, 0.0, 0.0, None
+
+    cap = max(float(COVERAGE_STALENESS_CAP_STEPS), 1.0)
+    current_tgap = min(info["raw_gap"] / cap, 1.0)
+    projected_tgap = min((info["raw_gap"] + relay_delay + horizon) / cap, 1.0)
+    marginal_loss = max(0.0, projected_tgap - current_tgap)
+
+    has_threat = bool(info.get("has_threat", False))
+    border_pr = float(info.get("border_pr", 0.0))
+    penalty_mult = 1.0
+    if has_threat:
+        penalty_mult += THREAT_ZONE_PENALTY
+    penalty_mult += PRIORITY_ZONE_WEIGHT * border_pr
+
+    weighted_loss = marginal_loss * penalty_mult
+    return weighted_loss, marginal_loss, current_tgap, {
+        "has_threat": has_threat, "border_priority": border_pr,
+        "penalty_multiplier": round(penalty_mult, 3),
+        "current_tgap": round(current_tgap, 3),
+        "projected_tgap": round(projected_tgap, 3),
+        "predictive_horizon": horizon,
+    }
+
+
+def _relay_utility_pool_predictive(feasible, needer, g, detected, step, weights=None,
+                                     horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Mirrors _relay_utility_pool() exactly (same pool-normalization,
+    same weighted-sum combination rule), except travel_energy and
+    coverage_loss are computed with the PREDICTIVE functions above instead
+    of current-state ones. relay_delay is left as-is (it IS already the
+    predicted arrival time, by definition -- there's nothing to predict
+    further about it)."""
+    if weights is None:
+        weights = NORMALIZED_WEIGHTS
+
+    rows = []
+    for cand, _travel_energy_current, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        pred_energy = _predicted_travel_energy(cand, needer, step)
+        coverage_loss, raw_marginal_loss, current_tgap, cov_meta = _predicted_coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay, horizon=horizon
+        )
+        rows.append({
+            "cand": cand, "distance": dist, "travel_energy": pred_energy,
+            "battery_margin": battery_margin, "coverage_loss": coverage_loss,
+            "raw_marginal_loss": raw_marginal_loss, "current_tgap": current_tgap,
+            "cov_meta": cov_meta, "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        r = rows[0]
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"], "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": 1.0, "membership_coverage": 1.0, "membership_delay": 1.0,
+            "score": 1.0, "note": "only feasible candidate -- no ranking needed",
+            "coverage_metadata": r["cov_meta"],
+        }
+        return [(r["cand"], 1.0, diag)]
+
+    energy_r = _fuzzy_normalize([r["travel_energy"] for r in rows], higher_is_better=False)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        utility = (w["W_TRAVEL_ENERGY"] * energy_r[i]
+                   + w["W_COVERAGE_LOSS"] * cov_r[i]
+                   + w["W_RELAY_DELAY"] * delay_r[i])
+        diag = {
+            "candidate_id": r["cand"]["id"], "role": r["cand"]["role"],
+            "distance": r["distance"], "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_energy": round(energy_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "score": round(utility, 4),
+            "coverage_metadata": r["cov_meta"],
+        }
+        scored.append((r["cand"], utility, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored
+
+
+def select_best_relay_predictive(needer, drones, g, detected, step, weights=None,
+                                   horizon=PREDICTIVE_COVERAGE_HORIZON):
+    """Policy F: RelayScore with predictive (future-wind energy +
+    extended-horizon coverage-loss) candidate attributes, same pool and
+    same combination rule as C/D/E. Compare against C (ranking-rule
+    effect isolated from prediction) and E (prediction vs reweighting, at
+    equal implementation-cost footing) to see which refinement actually
+    earns its complexity."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    scored = _relay_utility_pool_predictive(feasible, needer, g, detected, step, weights, horizon=horizon)
+    best_cand, _best_score, _best_diag = scored[0]
+    return best_cand, [diag for _, _, diag in scored]
+
+
+def tune_predictive_horizon(train_seeds, horizon_grid, max_steps=None, metric="coverage_pct"):
+    """Sweeps PREDICTIVE_COVERAGE_HORIZON on TRAIN seeds only (same
+    train/test discipline used for SSE_LAMBDA earlier in this project --
+    see run_terrain_aware_sse_experiment.py) so the reported horizon isn't
+    picked by peeking at the same seeds used for the final comparison.
+    Returns sorted results; caller should validate the winner on a
+    DISJOINT test seed set via run_six_way_comparison() before reporting
+    it in the thesis."""
+    max_steps = max_steps or a20.MAX_STEPS
+    results = []
+    for h in horizon_grid:
+        selector = lambda needer, drones, g, detected, step, weights=None, _h=h: \
+            select_best_relay_predictive(needer, drones, g, detected, step, weights=weights, horizon=_h)
+        vals = []
+        for seed in train_seeds:
+            m = simulate_fleet(seed, relay_selector=selector, max_steps=max_steps)
+            vals.append(m.get(metric))
+        clean = [v for v in vals if isinstance(v, (int, float))]
+        mean_v = round(statistics.mean(clean), 4) if clean else None
+        results.append({"horizon": h, f"mean_{metric}": mean_v})
+        print(f"  [PREDICTIVE_COVERAGE_HORIZON={h}] mean_{metric}={mean_v}")
+    results.sort(key=lambda r: (r[f"mean_{metric}"] is None, -(r[f"mean_{metric}"] or 0)))
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+# BASELINE (generalized nearest-only, for fair ablation comparison)
+# ══════════════════════════════════════════════════════════════
+def select_nearest_relay(needer, drones, g, detected, step, weights=None):
+    """Nearest-feasible baseline.
+
+    B and C use EXACTLY the same feasible candidate pool. B differs only in
+    the ranking rule: minimum Manhattan distance.
+    """
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    best = min(
+        feasible,
+        key=lambda x: _manhattan(
+            x[0]["r"], x[0]["c"], needer["r"], needer["c"]
+        )
+    )[0]
+
+    # Build diagnostics using the same component definitions as C, but do
+    # NOT use the RelayScore to select the baseline.
+    _score, best_diag = relay_score(
+        best, needer, g, detected, step, weights=weights
+    )
+    return best, ([best_diag] if best_diag is not None else [])
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY D — FUZZY MULTI-ATTRIBUTE RELAY SELECTION
+# (paper-comparison baseline, adapted from Zhu, Zhou & Zhang, 2017,
+#  Appl. Sci. 7(1):8, "Connectivity Maintenance Based on Multiple Relay
+#  UAVs Selection Scheme in Cooperative Surveillance")
+# ══════════════════════════════════════════════════════════════
+def _fuzzy_normalize(values, higher_is_better):
+    """Relative membership degree r_i in [0,1] for one attribute across a
+    candidate set: 1.0 = best candidate on this attribute, 0.0 = worst.
+    This is the standard fuzzy-optimum-selection normalization step (each
+    attribute is rescaled onto a common membership scale before the
+    weighted distance-to-ideal-solution is computed). If every candidate
+    ties on this attribute, everyone gets full membership (no information
+    to discriminate on, so it should not penalize anyone)."""
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-12:
+        return [1.0] * len(values)
+    if higher_is_better:
+        return [(v - lo) / (hi - lo) for v in values]
+    return [(hi - v) / (hi - lo) for v in values]
+
+
+def select_fuzzy_relay(needer, drones, g, detected, step, weights=None, p=2):
+    """Policy D: fuzzy multi-attribute-decision-making relay selection."""
+    if weights is None:
+        weights = FUZZY_ATTR_WEIGHTS
+
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return None, []
+
+    rows = []
+    # FIX: Rename _travel_energy to travel_energy and capture it
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, _raw, _tgap, _meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand,
+            "distance": dist,
+            "travel_energy": travel_energy,  # FIX: Store travel energy
+            "battery_margin": battery_margin,
+            "coverage_loss": coverage_loss,
+            "relay_delay": relay_delay,
+        })
+
+    if len(rows) == 1:
+        only = rows[0]
+        diag = {
+            "candidate_id": only["cand"]["id"],
+            "distance": only["distance"],
+            "travel_energy": round(only["travel_energy"], 3), # FIX: Output to diag
+            "battery_margin": round(only["battery_margin"], 2),
+            "coverage_loss": round(only["coverage_loss"], 6),
+            "relay_delay": only["relay_delay"],
+            "fuzzy_closeness": 1.0,
+            "note": "only feasible candidate -- no ranking needed",
+        }
+        return only["cand"], [diag]
+
+    dist_r = _fuzzy_normalize([r["distance"] for r in rows], higher_is_better=False)
+    batt_r = _fuzzy_normalize([r["battery_margin"] for r in rows], higher_is_better=True)
+    cov_r = _fuzzy_normalize([r["coverage_loss"] for r in rows], higher_is_better=False)
+    delay_r = _fuzzy_normalize([r["relay_delay"] for r in rows], higher_is_better=False)
+
+    w = weights
+    scored = []
+    for i, r in enumerate(rows):
+        terms = [
+            w["distance"] * (1 - dist_r[i]) ** p,
+            w["battery_margin"] * (1 - batt_r[i]) ** p,
+            w["coverage_loss"] * (1 - cov_r[i]) ** p,
+            w["relay_delay"] * (1 - delay_r[i]) ** p,
+        ]
+        dist_to_ideal = sum(terms) ** (1.0 / p)
+        closeness = 1.0 - dist_to_ideal   
+
+        diag = {
+            "candidate_id": r["cand"]["id"],
+            "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3), # FIX: Output to diag
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "membership_distance": round(dist_r[i], 3),
+            "membership_battery": round(batt_r[i], 3),
+            "membership_coverage": round(cov_r[i], 3),
+            "membership_delay": round(delay_r[i], 3),
+            "fuzzy_closeness": round(closeness, 4),
+        }
+        scored.append((r["cand"], closeness, diag))
+
+    scored.sort(key=lambda x: -x[1])
+    best_cand = scored[0][0]
+    return best_cand, [d for _, _, d in scored]
+
+
+# ══════════════════════════════════════════════════════════════
+# POLICY T -- TOPSIS  (Hwang & Yoon, 1981)
+# POLICY V -- VIKOR   (Opricovic, 1998)
+#
+# fuzzy MADM (Policy D, above) only computes a weighted Minkowski distance
+# to the POSITIVE ideal solution -- it never computes a negative ideal
+# solution or a closeness ratio, so it is NOT the same thing as TOPSIS
+# despite the superficial "distance-to-ideal" resemblance. These two
+# policies give genuinely different, textbook MCDM ranking rules to put
+# alongside D, using the SAME 4 attributes and the SAME relative-
+# importance weights (FUZZY_ATTR_WEIGHTS) as D, so the comparison isolates
+# the ranking METHOD rather than a different weighting choice.
+#
+#   T (TOPSIS): vector-normalize the decision matrix, apply weights, find
+#   the positive ideal solution (A+) and negative ideal solution (A-) per
+#   criterion, then rank by relative closeness C_i = S-_i / (S+_i + S-_i)
+#   -- HIGHER is better.
+#
+#   V (VIKOR): separately track group utility S_i (weighted sum of
+#   normalized gaps to the best value on each criterion) and individual
+#   regret R_i (the single worst gap), then blend them into a compromise
+#   score Q_i via trade-off weight v (default 0.5). Rank by Q_i --
+#   LOWER is better (opposite direction from D/T's closeness scores).
+# ══════════════════════════════════════════════════════════════
+TOPSIS_ATTR_WEIGHTS = dict(FUZZY_ATTR_WEIGHTS)
+VIKOR_ATTR_WEIGHTS = dict(FUZZY_ATTR_WEIGHTS)
+
+_MADM_CRITERIA = ("distance", "battery_margin", "coverage_loss", "relay_delay")
+# True = benefit criterion (higher raw value is better),
+# False = cost criterion (lower raw value is better)
+_MADM_BENEFIT = {
+    "distance": False,
+    "battery_margin": True,
+    "coverage_loss": False,
+    "relay_delay": False,
+}
+
+
+def _madm_build_rows(needer, drones, g, detected, step):
+    """Same row-building step as select_fuzzy_relay(): the 4 raw
+    attributes for every feasible candidate, so T and V score exactly
+    the same underlying data fuzzy MADM (D) scores."""
+    feasible = _feasible_candidate_pool(needer, drones)
+    if not feasible:
+        return []
+    rows = []
+    for cand, travel_energy, battery_margin in feasible:
+        dist = _manhattan(cand["r"], cand["c"], needer["r"], needer["c"])
+        relay_delay = dist
+        coverage_loss, _raw, _tgap, _meta = _coverage_loss_for_candidate(
+            cand, needer, g, detected, step, relay_delay
+        )
+        rows.append({
+            "cand": cand,
+            "distance": dist,
+            "travel_energy": travel_energy,
+            "battery_margin": battery_margin,
+            "coverage_loss": coverage_loss,
+            "relay_delay": relay_delay,
+        })
+    return rows
+
+
+def _madm_only_candidate_result(rows, extra_key, extra_val):
+    only = rows[0]
+    diag = {
+        "candidate_id": only["cand"]["id"],
+        "distance": only["distance"],
+        "travel_energy": round(only["travel_energy"], 3),
+        "battery_margin": round(only["battery_margin"], 2),
+        "coverage_loss": round(only["coverage_loss"], 6),
+        "relay_delay": only["relay_delay"],
+        extra_key: extra_val,
+        "note": "only feasible candidate -- no ranking needed",
+    }
+    return only["cand"], [diag]
+
+
+def select_topsis_relay(needer, drones, g, detected, step, weights=None):
+    """Policy T: classic TOPSIS relay selection."""
+    if weights is None:
+        weights = TOPSIS_ATTR_WEIGHTS
+
+    rows = _madm_build_rows(needer, drones, g, detected, step)
+    if not rows:
+        return None, []
+    if len(rows) == 1:
+        return _madm_only_candidate_result(rows, "topsis_closeness", 1.0)
+
+    # 1) vector normalization: r_ij = x_ij / sqrt(sum_i x_ij^2)
+    norms = {}
+    for crit in _MADM_CRITERIA:
+        vals = [r[crit] for r in rows]
+        denom = math.sqrt(sum(v * v for v in vals))
+        norms[crit] = denom if denom > 1e-12 else 1.0
+
+    # 2) weighted normalized matrix v_ij = w_j * r_ij
+    weighted = [
+        {crit: weights[crit] * (r[crit] / norms[crit]) for crit in _MADM_CRITERIA}
+        for r in rows
+    ]
+
+    # 3) positive ideal (A+) / negative ideal (A-) solution per criterion
+    ideal_pos, ideal_neg = {}, {}
+    for crit in _MADM_CRITERIA:
+        col = [w[crit] for w in weighted]
+        if _MADM_BENEFIT[crit]:
+            ideal_pos[crit], ideal_neg[crit] = max(col), min(col)
+        else:
+            ideal_pos[crit], ideal_neg[crit] = min(col), max(col)
+
+    # 4) + 5) distances and relative closeness
+    scored = []
+    for r, w in zip(rows, weighted):
+        s_pos = math.sqrt(sum((w[c] - ideal_pos[c]) ** 2 for c in _MADM_CRITERIA))
+        s_neg = math.sqrt(sum((w[c] - ideal_neg[c]) ** 2 for c in _MADM_CRITERIA))
+        closeness = s_neg / (s_pos + s_neg) if (s_pos + s_neg) > 1e-12 else 0.5
+        diag = {
+            "candidate_id": r["cand"]["id"],
+            "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "dist_to_positive_ideal": round(s_pos, 4),
+            "dist_to_negative_ideal": round(s_neg, 4),
+            "topsis_closeness": round(closeness, 4),
+        }
+        scored.append((r["cand"], closeness, diag))
+
+    scored.sort(key=lambda x: -x[1])  # higher closeness = better
+    best_cand = scored[0][0]
+    return best_cand, [d for _, _, d in scored]
+
+
+def select_vikor_relay(needer, drones, g, detected, step, weights=None, v=0.5):
+    """Policy V: VIKOR compromise-ranking relay selection. `v` (0..1) is
+    the group-utility/individual-regret trade-off weight; v=0.5 is
+    VIKOR's usual default. Ranks ASCENDING -- lowest Q_i wins."""
+    if weights is None:
+        weights = VIKOR_ATTR_WEIGHTS
+
+    rows = _madm_build_rows(needer, drones, g, detected, step)
+    if not rows:
+        return None, []
+    if len(rows) == 1:
+        return _madm_only_candidate_result(rows, "vikor_q", 0.0)
+
+    best_val, worst_val = {}, {}
+    for crit in _MADM_CRITERIA:
+        vals = [r[crit] for r in rows]
+        if _MADM_BENEFIT[crit]:
+            best_val[crit], worst_val[crit] = max(vals), min(vals)
+        else:
+            best_val[crit], worst_val[crit] = min(vals), max(vals)
+
+    S_list, R_list = [], []
+    for r in rows:
+        terms = []
+        for crit in _MADM_CRITERIA:
+            b, w_ = best_val[crit], worst_val[crit]
+            denom = abs(b - w_)
+            if denom < 1e-12:
+                terms.append(0.0)  # everyone ties -- no information here
+            elif _MADM_BENEFIT[crit]:
+                terms.append(weights[crit] * (b - r[crit]) / denom)
+            else:
+                terms.append(weights[crit] * (r[crit] - b) / denom)
+        S_list.append(sum(terms))
+        R_list.append(max(terms))
+
+    S_star, S_worst = min(S_list), max(S_list)
+    R_star, R_worst = min(R_list), max(R_list)
+    s_spread = (S_worst - S_star) if (S_worst - S_star) > 1e-12 else 1.0
+    r_spread = (R_worst - R_star) if (R_worst - R_star) > 1e-12 else 1.0
+
+    scored = []
+    for r, S_i, R_i in zip(rows, S_list, R_list):
+        Q_i = v * (S_i - S_star) / s_spread + (1 - v) * (R_i - R_star) / r_spread
+        diag = {
+            "candidate_id": r["cand"]["id"],
+            "role": r["cand"]["role"],
+            "distance": r["distance"],
+            "travel_energy": round(r["travel_energy"], 3),
+            "battery_margin": round(r["battery_margin"], 2),
+            "coverage_loss": round(r["coverage_loss"], 6),
+            "relay_delay": r["relay_delay"],
+            "vikor_S": round(S_i, 4),
+            "vikor_R": round(R_i, 4),
+            "vikor_q": round(Q_i, 4),
+        }
+        scored.append((r["cand"], Q_i, diag))
+
+    scored.sort(key=lambda x: x[1])  # LOWER Q = better for VIKOR
+    best_cand = scored[0][0]
+    return best_cand, [d for _, _, d in scored]
+
+
+# Policy label -> selector function, shared by run_fleet_size_sensitivity_analysis()
+# and run_terrain_wind_generalization_analysis() so both sweeps can be extended
+# to include TOPSIS (T) / VIKOR (V) with a single `policies` argument instead of
+# two separately-hardcoded C-vs-D loops. Placed here (after select_best_relay,
+# select_topsis_relay, select_vikor_relay are all defined, and right before
+# select_fuzzy_relay_true_fis is imported below) so every name it references
+# already exists at module-load time.
+def _vikor_selector(*args, **kwargs):
+    return select_vikor_relay(*args, v=0.5, **kwargs)
+from surrogate_fis import select_fuzzy_relay_surrogate_fis
+
+POLICY_SELECTORS = {
+    "C": select_best_relay,
+    "D": None, # filled in just below, once select_fuzzy_relay_true_fis exists
+    "T": select_topsis_relay,
+    "D2": select_fuzzy_relay_surrogate_fis,  # <-- NEW: Surrogate FIS
+    "V": _vikor_selector,
+    "I": select_best_relay_coverage_aware,
+}
+POLICY_DISPLAY_NAMES = {
+    "C": "RelayScore", "D": "true FIS", "T": "TOPSIS","D2": "Surrogate FIS", "V": "VIKOR",
+    "I": "RelayScore-CovFix",
+}
+
+from policy_d_true_fis import (
+    select_fuzzy_relay_true_fis,
+    select_fuzzy_relay_true_fis_indep_weights,
+    DEFAULT_RULE_WEIGHTS,
+    INDEPENDENT_RULE_WEIGHTS,
+)
+POLICY_SELECTORS["D"] = select_fuzzy_relay_true_fis
+
+# ══════════════════════════════════════════════════════════════
+# ENERGY ACCUMULATION HELPER (BUGFIX)
+# ══════════════════════════════════════════════════════════════
+def _track_energy(state, cost):
+    """Safely accumulate a per-step energy cost into state['total_energy_consumed'].
+
+    calculate_actual_step_cost() can legitimately return float('inf') when
+    stochastic wind pushes the required airspeed past the drone's hardware
+    cap (a20.owt_wind_cost() -> a20.owt_required_airspeed() returning None ->
+    float('inf'), "exceeds hardware airspeed capability -> impassable").
+
+    a20.py's own DroneSimHeadless._track_energy() already special-cases this:
+    an inf cost is routed to a *_stranded counter and is NEVER added to the
+    running energy total. This mirrors that behavior for the Policy C/D/E
+    fleet simulation here, where the same inf could previously be summed
+    into state["total_energy_consumed"], permanently poisoning it to inf
+    for the rest of the run (deterministic dynamic wind tops out around
+    6 m/s and never triggers this; stochastic wind can reach ~12 m/s in any
+    direction, which is why the bug only ever showed up in stochastic mode).
+    """
+    if cost == float('inf'):
+        state["stranded_events"] += 1
+    else:
+        state["total_energy_consumed"] += cost
+
+
+# ══════════════════════════════════════════════════════════════
+# ONE SIMULATION STEP FOR THE WHOLE FLEET
+# ══════════════════════════════════════════════════════════════
+def step_fleet(state, relay_selector=select_best_relay):
+    g, detected, drones, step = state["g"], state["detected"], state["drones"], state["step"]
+    a20.advance_sim_clock(step)   # keep dynamic-wind clock in sync (no-op if WIND_DYNAMIC_ENABLED=False)
+    by_id = {d["id"]: d for d in drones}
+
+    for d in drones:
+        if d["role"] != "returning":
+            continue
+        tr, tc = d["return_target"]
+        if (d["r"], d["c"]) == (tr, tc):
+            d["battery"] = 100.0
+            d["cycles"] += 1  # one more full recharge cycle completed -> pack ages (SOH model)
+            d["target_zone"] = None; d["target_cell"] = None
+            d["pr"] = d["pc"] = None
+            state["RC"] += 1
+            active_now = sum(1 for x in drones
+                              if x["id"] != d["id"] and x["role"] in ("patrol", "relay_incoming"))
+            if active_now < state["target_patrol_count"]:
+                d["role"] = "patrol"
+            else:
+                d["role"] = "idle_reserve"
+        else:
+            old_r, old_c = d["r"], d["c"]
+            nr, nc = a20.move_toward(d["r"], d["c"], tr, tc)
+            d["r"], d["c"] = nr, nc
+            cost = a20.calculate_actual_step_cost(
+                old_r, old_c, nr, nc, None, None,
+                current_soc_pct=(d["battery"] if a20.USE_NONLINEAR_BATTERY else None),
+                cycle_count=(d["cycles"] if a20.USE_SOH_AGING else 0))
+            d["battery"] = max(0.0, d["battery"] - cost)
+            _track_energy(state, cost)
+            a20.sensor_sweep(nr, nc, g, detected, step=step)
+
+    for d in drones:
+        if d["role"] != "relay_incoming":
+            continue
+        needer = by_id.get(d["rendezvous_id"])
+        if needer is None:
+            d["role"] = "patrol"; continue
+        tr, tc = needer["r"], needer["c"]
+        dist_now = _manhattan(d["r"], d["c"], tr, tc)
+        if dist_now <= 1:
+            state["relay_fulfilled"] += 1
+            st = a20.nearest_st(needer["r"], needer["c"])
+            needer["role"] = "returning"
+            needer["return_target"] = st
+            needer["awaiting_relay"] = False
+            needer["relay_episode_counted"] = False   
+            d["role"] = "patrol"
+            d["rendezvous_id"] = None
+            d["target_zone"] = None; d["target_cell"] = None
+            d["pr"] = d["pc"] = None
+        else:
+            old_r, old_c = d["r"], d["c"]
+            nr, nc = a20.move_toward(d["r"], d["c"], tr, tc)
+            d["r"], d["c"] = nr, nc
+            cost = a20.calculate_actual_step_cost(
+                old_r, old_c, nr, nc, None, None,
+                current_soc_pct=(d["battery"] if a20.USE_NONLINEAR_BATTERY else None),
+                cycle_count=(d["cycles"] if a20.USE_SOH_AGING else 0))
+            d["battery"] = max(0.0, d["battery"] - cost)
+            _track_energy(state, cost)
+            a20.sensor_sweep(nr, nc, g, detected, step=step)
+
+    for d in drones:
+        if d["role"] != "patrol":
+            continue
+
+        if not d["awaiting_relay"]:
+            nh, _st = a20.needs_handoff_now(d["r"], d["c"], d["battery"])
+            if nh:
+                if not d["relay_episode_counted"]:
+                    state["relay_requested"] += 1
+                    d["relay_episode_counted"] = True
+                
+                _t0 = time.perf_counter()
+                chosen, _diag = relay_selector(d, drones, g, detected, step)
+                _t1 = time.perf_counter()
+                _dt = _t1 - _t0
+                state["selector_time_total_s"] += _dt
+                state["selector_time_samples_s"].append(_dt)
+                state["selector_calls"] += 1
+                if chosen is not None:
+                    d["awaiting_relay"] = True
+                    real = by_id[chosen["id"]]
+                    real["role"] = "relay_incoming"
+                    real["rendezvous_id"] = d["id"]
+                    
+                    state["log"].append({
+                        "step": step,
+                        "needer_id": d["id"],
+                        "chosen_candidate_id": chosen["id"],
+                        "candidates_diag": deepcopy(_diag)
+                    })
+
+        mrc, e_ret, st2 = a20.must_recharge_now(d["r"], d["c"], d["battery"])
+        if mrc:
+            cost = a20.calculate_actual_step_cost(
+                d["r"], d["c"], d["r"], d["c"], d["pr"], d["pc"],
+                current_soc_pct=(d["battery"] if a20.USE_NONLINEAR_BATTERY else None),
+                cycle_count=(d["cycles"] if a20.USE_SOH_AGING else 0))
+            d["battery"] = max(0.0, d["battery"] - cost)
+            _track_energy(state, cost)
+            a20.sensor_sweep(d["r"], d["c"], g, detected, step=step)
+            continue
+
+        if d["target_zone"]:
+            zr, zc = d["target_zone"]
+            if a20.get_zone_id(d["r"], d["c"]) == (zr, zc) and a20.find_uncovered_in_zone(zr, zc, g) is None:
+                d["target_zone"] = None; d["target_cell"] = None
+        if not d["target_zone"]:
+            rk = a20.rank_zones(d["r"], d["c"], g, detected, step)
+
+            claimed = {x["target_zone"] for x in drones
+                       if x["id"] != d["id"] and x["role"] == "patrol" and x["target_zone"] is not None}
+            rk_avail = [entry for entry in rk if entry["zone"] not in claimed]
+            if not rk_avail:
+                rk_avail = rk
+
+            d["target_zone"], d["target_cell"] = a20.select_zone_mixed_strategy(
+                rk_avail, g, d["r"], d["c"], d["battery"], d["zone_rng"], step)
+
+        old_r, old_c = d["r"], d["c"]
+        nr, nc, _bd = a20.smart_move(d["r"], d["c"], d["pr"], d["pc"], g, detected, d["target_zone"])
+        d["r"], d["c"] = nr, nc
+        cost = a20.calculate_actual_step_cost(
+            old_r, old_c, nr, nc, old_r if d["pr"] is None else d["pr"],
+            old_c if d["pc"] is None else d["pc"],
+            current_soc_pct=(d["battery"] if a20.USE_NONLINEAR_BATTERY else None),
+            cycle_count=(d["cycles"] if a20.USE_SOH_AGING else 0))
+        d["battery"] = max(0.0, d["battery"] - cost)
+        _track_energy(state, cost)
+        a20.sensor_sweep(nr, nc, g, detected, step=step)
+        d["pr"], d["pc"] = old_r, old_c
+
+        if d["target_zone"]:
+            d["target_cell"] = a20.find_uncovered_in_zone(*d["target_zone"], g)
+
+    state["step"] += 1
+    return state
+
+
+# ══════════════════════════════════════════════════════════════
+# METRICS & PLOTTING
+# ══════════════════════════════════════════════════════════════
+def _extract_baseline_a_metrics(seed, max_steps):
+    """Runs a20.py's ORIGINAL architecture unchanged..."""
+    sim = a20.DroneSimHeadless(seed)
+    sim.run(max_steps)
+
+    g, detected, step = sim.gs, sim.s_detected, sim.step
+    staleness_values = [step - c["last_visited_step"] for c in g.values() if not c["is_station"]]
+    avg_staleness = statistics.mean(staleness_values) if staleness_values else 0.0
+    max_staleness = max(staleness_values) if staleness_values else 0.0
+
+    requested = sim.sR if sim.sR > 0 else (1 if sim.s_handoff_mode else 0)
+    fulfilled = sim.sR   # every handoff in this architecture succeeds by construction
+
+    return {
+        "coverage_pct": a20.coverage_pct(g),
+        "avg_zone_staleness_steps": round(avg_staleness, 2),
+        "max_zone_staleness_steps": max_staleness,
+        "detection_rate": round(len(detected) / a20.NUM_THREATS, 4) if a20.NUM_THREATS else None,
+        "threats_detected": len(detected),
+        "threats_total": a20.NUM_THREATS,
+        "relay_success_rate": round(fulfilled / requested, 4) if requested > 0 else None,
+        "avg_relay_delay_steps": None,     
+        "avg_relay_energy_pct": None,
+        "avg_relay_coverage_gap": None,
+        "mission_completed": sim.s_first_all is not None,
+        "first_all_threats_step": sim.s_first_all,
+        "first_full_coverage_step": sim.s_full_cov_step,
+        "avg_final_battery": round(sim.s_active["b"], 2),
+        "avg_patrol_battery": round(sim.s_active["b"], 2),   
+        "avg_reserve_battery": None,                          
+        "total_energy_consumed": round(sim.s_energy, 2),      
+        "relay_requested": requested,
+        "relay_fulfilled": fulfilled,
+        
+        # ── FIXED: MISSING TIMING METRICS ADDED HERE ──
+        "avg_selector_time_ms": None,
+        "median_selector_time_ms": None,
+        "trimmed_mean_selector_time_ms": None,
+        "max_selector_time_ms": None,
+        "total_selector_time_ms": None,
+        "selector_calls": None,
+        # ──────────────────────────────────────────────
+
+        "RC": sim.sR,
+        "final_drone_count": 1,
+    }
+
+
+def collect_metrics(state):
+    g, detected, drones = state["g"], state["detected"], state["drones"]
+    active_drones = [d for d in drones]
+
+    patrol_pool = [d for d in active_drones if d["role"] != "idle_reserve"]
+    reserve_pool = [d for d in active_drones if d["role"] == "idle_reserve"]
+    avg_patrol_battery = round(statistics.mean(d["battery"] for d in patrol_pool), 2) if patrol_pool else None
+    avg_reserve_battery = round(statistics.mean(d["battery"] for d in reserve_pool), 2) if reserve_pool else None
+
+    staleness_values = [state["step"] - c["last_visited_step"] for c in g.values() if not c["is_station"]]
+    avg_staleness = statistics.mean(staleness_values)
+    max_staleness = max(staleness_values)   
+
+    requested = state["relay_requested"]
+    fulfilled = state["relay_fulfilled"]
+    success_rate = round(fulfilled / requested, 4) if requested > 0 else None
+
+    chosen_diags = []
+    for entry in state["log"]:
+        for diag in entry["candidates_diag"]:
+            if diag.get("candidate_id") == entry["chosen_candidate_id"]:
+                chosen_diags.append(diag)
+                break
+
+    avg_relay_delay = round(statistics.mean(d.get("relay_delay", 0) for d in chosen_diags), 3) if chosen_diags else None
+    avg_relay_energy = round(statistics.mean(d.get("travel_energy", 0) for d in chosen_diags), 3) if chosen_diags else None
+    avg_coverage_gap = round(statistics.mean(d.get("coverage_loss", 0) for d in chosen_diags), 3) if chosen_diags else None
+
+    detection_rate = round(len(detected) / a20.NUM_THREATS, 4) if a20.NUM_THREATS else None
+
+    selector_calls = state.get("selector_calls", 0)
+    selector_time_total_s = state.get("selector_time_total_s", 0.0)
+    avg_selector_time_ms = (
+        round(1000.0 * selector_time_total_s / selector_calls, 4)
+        if selector_calls > 0 else None
+    )
+
+    # Robust companions to avg_selector_time_ms: a single freak call (a
+    # cold FIS cache build, a GC pause, the OS scheduling this process out
+    # for a moment) inflates the plain mean by a lot when selector_calls is
+    # small (typically 15-25 per mission here), because there's nothing to
+    # dilute it with. Median is unaffected by one outlier by construction.
+    # A 10%-trimmed mean is reported too: it stays closer to "typical"
+    # per-call cost than the mean while, unlike the median, still using
+    # most of the sample rather than a single order statistic.
+    _samples_ms = sorted(1000.0 * s for s in state.get("selector_time_samples_s", []))
+    if _samples_ms:
+        median_selector_time_ms = round(statistics.median(_samples_ms), 4)
+        _trim = int(len(_samples_ms) * 0.10)
+        _trimmed = _samples_ms[_trim: len(_samples_ms) - _trim] if _trim > 0 else _samples_ms
+        trimmed_mean_selector_time_ms = round(statistics.mean(_trimmed), 4) if _trimmed else None
+        max_selector_time_ms = round(_samples_ms[-1], 4)
+    else:
+        median_selector_time_ms = None
+        trimmed_mean_selector_time_ms = None
+        max_selector_time_ms = None
+
+    return {
+        "coverage_pct": a20.coverage_pct(g),                       
+        "avg_zone_staleness_steps": round(avg_staleness, 2),       
+        "max_zone_staleness_steps": max_staleness,                 
+        "detection_rate": detection_rate,                          
+        "threats_detected": len(detected),
+        "threats_total": a20.NUM_THREATS,
+        "relay_success_rate": success_rate,
+        "avg_relay_delay_steps": avg_relay_delay,
+        "avg_relay_energy_pct": avg_relay_energy,
+        "avg_relay_coverage_gap": avg_coverage_gap,
+        "mission_completed": state["first_all_threats_step"] is not None,   
+        "first_all_threats_step": state["first_all_threats_step"],
+        "first_full_coverage_step": state["first_full_coverage_step"],
+        "avg_final_battery": avg_patrol_battery,        
+        "avg_patrol_battery": avg_patrol_battery,        
+        "avg_reserve_battery": avg_reserve_battery,      
+        "total_energy_consumed": round(state["total_energy_consumed"], 2),  
+        "stranded_events": state["stranded_events"],   # BUGFIX: steps where required airspeed
+                                                        # exceeded hardware cap (inf-cost, only
+                                                        # possible under stochastic wind) --
+                                                        # excluded from total_energy_consumed
+                                                        # rather than poisoning it to inf
+        "relay_requested": requested,                              
+        "relay_fulfilled": fulfilled,
+        "avg_selector_time_ms": avg_selector_time_ms,   
+        "median_selector_time_ms": median_selector_time_ms,
+        "trimmed_mean_selector_time_ms": trimmed_mean_selector_time_ms,
+        "max_selector_time_ms": max_selector_time_ms,
+        "total_selector_time_ms": round(1000.0 * selector_time_total_s, 3),
+        "selector_calls": selector_calls,
+        "RC": state["RC"],
+        "final_drone_count": len(active_drones),
+        "decision_log": state["log"]
+    }
+
+PRIMARY_METRICS = ["coverage_pct", "avg_zone_staleness_steps", "max_zone_staleness_steps"]
+SECONDARY_METRICS = ["detection_rate", "relay_success_rate", "avg_relay_delay_steps",
+                      "avg_relay_energy_pct", "mission_completed", "avg_final_battery",
+                      "avg_patrol_battery", "avg_reserve_battery", "total_energy_consumed",
+                      "relay_requested", "avg_selector_time_ms", "median_selector_time_ms",
+                      "trimmed_mean_selector_time_ms", "total_selector_time_ms"]
+
+def simulate_fleet(seed, relay_selector=select_best_relay, num_drones=NUM_DRONES,
+                    num_reserves=RESERVE_POOL_SIZE, max_steps=None):
+    max_steps = max_steps or a20.MAX_STEPS
+    state = init_fleet(seed, num_drones, num_reserves)
+    for _ in range(max_steps):
+        step_fleet(state, relay_selector=relay_selector)
+        if state["first_all_threats_step"] is None and len(state["detected"]) >= a20.NUM_THREATS:
+            state["first_all_threats_step"] = state["step"]
+        if state["first_full_coverage_step"] is None and a20.coverage_pct(state["g"]) >= 100:
+            state["first_full_coverage_step"] = state["step"]
+    return collect_metrics(state)
+
+def plot_decision_breakdown(log_entry, weights=DEFAULT_WEIGHTS,
+                            save_path="decision_breakdown.png"):
+    if 'pd' not in globals() or 'plt' not in globals():
+        print("❌ Cannot plot: pandas or matplotlib is missing.")
+        return
+
+    data = []
+    for diag in log_entry["candidates_diag"]:
+        if diag.get("score") is None:
+            continue
+
+        cand_id = diag["candidate_id"]
+        energy_cost = -(weights["W_TRAVEL_ENERGY"] * diag.get("travel_energy", 0))
+        cov_loss_cost = -(weights["W_COVERAGE_LOSS"] * diag.get("coverage_loss", 0))
+        delay_cost = -(weights["W_RELAY_DELAY"] * diag.get("relay_delay", 0))
+
+        is_winner = cand_id == log_entry["chosen_candidate_id"]
+        label = f"Drone {cand_id}\n(Winner)" if is_winner else f"Drone {cand_id}"
+
+        data.append({
+            "Candidate": label,
+            "Feasibility headroom": diag.get("battery_margin", 0),
+            "Energy Cost (-)": energy_cost,
+            "Coverage Cost (-)": cov_loss_cost,
+            "Delay Cost (-)": delay_cost,
+            "Net Utility": energy_cost + cov_loss_cost + delay_cost,
+        })
+
+    if not data:
+        print("ℹ️ No feasible candidate diagnostics available for plotting.")
+        return
+
+    df = pd.DataFrame(data).set_index("Candidate")
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    df[["Energy Cost (-)", "Coverage Cost (-)", "Delay Cost (-)"]].plot(
+        kind="bar", stacked=True, ax=ax, width=0.6
+    )
+    ax.plot(
+        range(len(df)),
+        df["Net Utility"],
+        marker='D',
+        linestyle='',
+        markersize=8,
+        label="Net Utility"
+    )
+    ax.axhline(0, linewidth=1.2)
+    ax.set_title(
+        f"Mission-Aware Relay Decision (Step {log_entry['step']} - "
+        f"Needer: Drone {log_entry['needer_id']})",
+        fontsize=12, fontweight='bold'
+    )
+    ax.set_ylabel("Weighted utility / cost units")
+    ax.set_xticklabels(df.index, rotation=0)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"✅ Generated and saved decision breakdown chart to {save_path}")
+
+def run_sensitivity_analysis(weight_name, sweep_values, seeds, max_steps=None,
+                              base_weights=None, out_csv=None):
+    base_weights = dict(base_weights or NORMALIZED_WEIGHTS)
+    if weight_name not in base_weights:
+        raise ValueError(
+            f"Unknown weight '{weight_name}'. Choose from {list(base_weights)}"
+        )
+
+    results = []
+    for val in sweep_values:
+        trial_weights = dict(base_weights)
+        trial_weights[weight_name] = val
+        selector = partial(select_best_relay, weights=trial_weights)
+
+        per_seed = [
+            simulate_fleet(seed, relay_selector=selector, max_steps=max_steps)
+            for seed in seeds
+        ]
+
+        def mean_metric(name):
+            vals = [
+                r[name] for r in per_seed
+                if isinstance(r.get(name), (int, float))
+            ]
+            return round(statistics.mean(vals), 3) if vals else None
+
+        row = {
+            weight_name: val,
+            "coverage_pct": mean_metric("coverage_pct"),
+            "avg_zone_staleness_steps": mean_metric("avg_zone_staleness_steps"),
+            "avg_final_battery": mean_metric("avg_final_battery"),
+            "total_energy_consumed": mean_metric("total_energy_consumed"),
+            "relay_success_rate": mean_metric("relay_success_rate"),
+        }
+        results.append(row)
+
+        print(
+            f"[{weight_name}={val}] "
+            f"coverage={row['coverage_pct']}% "
+            f"staleness={row['avg_zone_staleness_steps']} "
+            f"energy={row['total_energy_consumed']}"
+        )
+
+    if out_csv and results:
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
+            writer.writeheader()
+            writer.writerows(results)
+
+    return results
+
+def plot_sensitivity(results, weight_name, metric="coverage_pct",
+                      save_path="sensitivity_analysis.png"):
+    if 'pd' not in globals() or 'plt' not in globals():
+        print("❌ Cannot plot: pandas or matplotlib is missing.")
+        return
+
+    df = pd.DataFrame(results)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(df[weight_name], df[metric], marker='o', color="#1f77b4")
+    ax.set_xlabel(weight_name)
+    ax.set_ylabel(metric)
+    ax.set_title(f"Sensitivity of {metric} to {weight_name}", fontweight='bold')
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    print(f"✅ Generated and saved sensitivity plot to {save_path}")
+
+def run_comparison(seeds, max_steps=None, out_csv=None, weights=None):
+    selector_c = partial(select_best_relay, weights=weights) if weights else select_best_relay
+
+    rows = []
+    for seed in seeds:
+        base = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              max_steps=max_steps)
+        opt = simulate_fleet(seed, relay_selector=selector_c,
+                             max_steps=max_steps)
+
+        row = {"seed": seed}
+        for k, v in base.items():
+            if k != "decision_log":
+                row[f"baseline_{k}"] = v
+        for k, v in opt.items():
+            if k != "decision_log":
+                row[f"optimized_{k}"] = v
+        rows.append(row)
+
+        print(
+            f"[seed {seed}] "
+            f"baseline cov={base['coverage_pct']}% "
+            f"staleness={base['avg_zone_staleness_steps']} "
+            f"relay_success={base['relay_success_rate']} | "
+            f"optimized cov={opt['coverage_pct']}% "
+            f"staleness={opt['avg_zone_staleness_steps']} "
+            f"relay_success={opt['relay_success_rate']}"
+        )
+
+    if out_csv and rows:
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    metrics = [
+        "coverage_pct",
+        "avg_zone_staleness_steps",
+        "max_zone_staleness_steps",
+        "detection_rate",
+        "avg_final_battery",
+        "total_energy_consumed",
+        "relay_success_rate",
+        "avg_relay_delay_steps",
+        "avg_relay_energy_pct",
+        "avg_relay_coverage_gap",
+    ]
+
+    summary = {}
+    for metric in metrics:
+        base_vals = [r[f"baseline_{metric}"] for r in rows]
+        opt_vals = [r[f"optimized_{metric}"] for r in rows]
+        stats = _safe_wilcoxon(base_vals, opt_vals)
+
+        summary[metric] = {
+            "baseline_mean": round(
+                statistics.mean(
+                    [x for x in base_vals if isinstance(x, (int, float))]
+                ), 3
+            ) if any(isinstance(x, (int, float)) for x in base_vals) else None,
+            "optimized_mean": round(
+                statistics.mean(
+                    [x for x in opt_vals if isinstance(x, (int, float))]
+                ), 3
+            ) if any(isinstance(x, (int, float)) for x in opt_vals) else None,
+            **stats,
+        }
+
+    return rows, summary
+
+def run_three_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                              num_reserves=RESERVE_POOL_SIZE, out_csv=None):
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"A(orig): cov={m_a['coverage_pct']}% staleness(avg/max)={m_a['avg_zone_staleness_steps']}/{m_a['max_zone_staleness_steps']}  |  "
+              f"B(8-drone,nearest): cov={m_b['coverage_pct']}% staleness(avg/max)={m_b['avg_zone_staleness_steps']}/{m_b['max_zone_staleness_steps']}  |  "
+              f"C(8-drone,RelayScore): cov={m_c['coverage_pct']}% staleness(avg/max)={m_c['avg_zone_staleness_steps']}/{m_c['max_zone_staleness_steps']}")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        a_vals = [r[f"A_{metric}"] for r in rows]
+        b_vals = [r[f"B_{metric}"] for r in rows]
+        c_vals = [r[f"C_{metric}"] for r in rows]
+        entry = {}
+        for label, vals in (("A", a_vals), ("B", b_vals), ("C", c_vals)):
+            clean = [v for v in vals if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        fleet_effect = _safe_wilcoxon(a_vals, b_vals)  
+        relay_effect = _safe_wilcoxon(b_vals, c_vals)  
+        entry["fleet_effect_A_vs_B"] = fleet_effect
+        entry["relay_intel_effect_B_vs_C"] = relay_effect
+        summary[metric] = entry
+    print("\n=== A vs B vs C SUMMARY (fleet-size effect: A->B | relay-intelligence effect: B->C) ===")
+    print(json.dumps(summary, indent=2, default=str))
+    return rows, summary
+def _print_significance_summary(summary, comparisons, n=None, alpha=0.05):
+    print(f"\n--- Statistical significance readout (alpha={alpha}, n={n} seeds) ---")
+    for metric, entry in summary.items():
+        for key, label_a, label_b in comparisons:
+            stat = entry.get(key)
+            if not stat or stat.get("wilcoxon_p") is None:
+                continue
+            p = stat["wilcoxon_p"]
+            mean_a = entry.get(f"{label_a}_mean")
+            mean_b = entry.get(f"{label_b}_mean")
+            tag = "SIGNIFICANT" if p < alpha else "not significant"
+            marker = "✅" if p < alpha else "—"
+            test_note = " [t-test fallback]" if stat.get("test_used") == "ttest_rel_fallback" else ""
+            print(f"{marker} [{metric}] {label_a}_mean={mean_a}  {label_b}_mean={mean_b}  "
+                  f"diff({label_b}-{label_a})={stat['mean_diff']}  p={p}{test_note}  ({tag})")
+            
+def run_four_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                             num_reserves=RESERVE_POOL_SIZE, out_csv=None):
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay_true_fis,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c), ("D", m_d)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"A(orig): cov={m_a['coverage_pct']}%  |  "
+              f"B(nearest): cov={m_b['coverage_pct']}%  |  "
+              f"C(RelayScore): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy-MADM): cov={m_d['coverage_pct']}%")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("A", "B", "C", "D"):
+            vals[label] = [r.get(f"{label}_{metric}") for r in rows]
+        entry = {}
+        for label in ("A", "B", "C", "D"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fleet_effect_A_vs_B"] = _safe_wilcoxon(vals["A"], vals["B"])
+        entry["relay_intel_effect_B_vs_C"] = _safe_wilcoxon(vals["B"], vals["C"])
+        entry["relay_intel_effect_B_vs_D"] = _safe_wilcoxon(vals["B"], vals["D"])
+        entry["ranking_rule_effect_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        summary[metric] = entry
+
+    print("\n=== A vs B vs C vs D SUMMARY ===")
+    print("(fleet-size: A->B | RelayScore vs nearest: B->C | "
+          "fuzzy-MADM vs nearest: B->D | RelayScore vs fuzzy-MADM: C->D)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fleet_effect_A_vs_B", "A", "B"),
+            ("relay_intel_effect_B_vs_C", "B", "C"),
+            ("relay_intel_effect_B_vs_D", "B", "D"),
+            ("ranking_rule_effect_C_vs_D", "C", "D"),
+        ],
+        n=len(seeds),
+    )
+    return rows, summary
+
+
+# ══════════════════════════════════════════════════════════════
+# COMPARISON RUNNER -- C (RelayScore) vs D (fuzzy MADM / true FIS) vs
+#                       T (TOPSIS) vs V (VIKOR), same pattern as
+#                       run_four_way_comparison() above.
+# ══════════════════════════════════════════════════════════════
+def run_topsis_vikor_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                                 num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                                 fuzzy_selector=None, vikor_v=0.5,
+                                 policies=("C", "D", "T", "V")):
+    """C vs D vs T vs V (vs D2, vs I, vs anything else in POLICY_SELECTORS)
+    -- runs every requested policy on the same seeds and reports
+    coverage/staleness/etc. metrics with CSV export + Wilcoxon
+    significance + matched-pairs rank-biserial effect size (same
+    convention as Relay_System.py's _paired_effect_stats()), mirroring
+    run_four_way_comparison().
+
+    `policies`: which policy labels to run, from POLICY_SELECTORS
+    ("C"=RelayScore, "D"=true FIS, "T"=TOPSIS, "V"=VIKOR, "D2"=surrogate
+    FIS if surrogate_fis.py's LUT is wired in, "I"=RelayScore-CovFix,
+    ...). Defaults to the original ("C","D","T","V") for backward
+    compatibility with existing scripts/output-key expectations. Pass
+    e.g. policies=("C","D","D2","T","V") for the fuller thesis
+    comparison -- every metric, significance test, and effect size below
+    is computed for whichever policies you list, no other code changes
+    needed.
+
+    fuzzy_selector overrides what "D" itself runs (still defaults to
+    select_fuzzy_relay_true_fis); this only affects the "D" label, not
+    any other requested policy such as "D2".
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    if fuzzy_selector is not None:
+        selectors = dict(POLICY_SELECTORS)
+        selectors["D"] = fuzzy_selector
+    else:
+        selectors = POLICY_SELECTORS
+    if vikor_v != 0.5:
+        selectors = dict(selectors)
+        selectors["V"] = lambda *a, **kw: select_vikor_relay(*a, v=vikor_v, **kw)
+
+    non_d_policies = [p for p in policies if p != "D"]
+
+    rows = []
+    for seed in seeds:
+        metrics_by_policy = {}
+        for label in policies:
+            metrics_by_policy[label] = simulate_fleet(
+                seed, relay_selector=selectors[label],
+                num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps,
+            )
+        row = {"seed": seed}
+        for label, m in metrics_by_policy.items():
+            for k, val in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = val
+        rows.append(row)
+
+        summary_bits = "  |  ".join(
+            f"{label}({POLICY_DISPLAY_NAMES.get(label, label)}): "
+            f"cov={metrics_by_policy[label]['coverage_pct']}%"
+            for label in policies
+        )
+        print(f"[seed {seed}] {summary_bits}")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {label: [r.get(f"{label}_{metric}") for r in rows] for label in policies}
+        entry = {}
+        for label in policies:
+            clean = [x for x in vals[label] if isinstance(x, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+
+        comparisons = []
+        if "D" in policies:
+            for label in non_d_policies:
+                key = f"{label}_vs_D"
+                entry[key] = _safe_wilcoxon(vals[label], vals["D"])
+                entry[f"{key}_effect"] = _rank_biserial_paired(vals[label], vals["D"])
+                comparisons.append((key, label, "D"))
+        # every non-D pair against each other too (e.g. T vs V, D2 vs T,
+        # D2 vs V) -- the interesting "which cheap alternative is best"
+        # question, not just "which beats D"
+        for i, label_a in enumerate(non_d_policies):
+            for label_b in non_d_policies[i + 1:]:
+                key = f"{label_a}_vs_{label_b}"
+                entry[key] = _safe_wilcoxon(vals[label_a], vals[label_b])
+                entry[f"{key}_effect"] = _rank_biserial_paired(vals[label_a], vals[label_b])
+                comparisons.append((key, label_a, label_b))
+        entry["_comparisons"] = comparisons
+        summary[metric] = entry
+
+    print(f"\n=== {' vs '.join(policies)} SUMMARY ===")
+    print(json.dumps({m: {k: v for k, v in e.items() if k != "_comparisons"} for m, e in summary.items()},
+                      indent=2, default=str))
+
+    all_comparisons = summary[PRIMARY_METRICS[0]]["_comparisons"] if PRIMARY_METRICS else []
+    _print_significance_summary(
+        {m: {k: v for k, v in e.items() if k != "_comparisons"} for m, e in summary.items()},
+        comparisons=[(key, a, b) for key, a, b in all_comparisons],
+        n=len(seeds),
+    )
+
+    # Headline readout: selector-time speedup for every non-D policy vs D,
+    # since "same quality, how much faster" is almost always the number a
+    # thesis actually leads with.
+    print("\n--- Headline: selector time (median) & speedup vs D ---")
+    time_metric = "median_selector_time_ms"
+    d_time = summary.get(time_metric, {}).get("D_mean")
+    for label in policies:
+        t = summary.get(time_metric, {}).get(f"{label}_mean")
+        if label == "D" or t is None:
+            print(f"  {label} ({POLICY_DISPLAY_NAMES.get(label, label)}): {t} ms")
+            continue
+        speedup = round(d_time / t, 1) if (d_time and t and t > 0) else None
+        p = summary.get(time_metric, {}).get(f"{label}_vs_D")
+        pval = (p or {}).get("wilcoxon_p")
+        print(f"  {label} ({POLICY_DISPLAY_NAMES.get(label, label)}): {t} ms  "
+              f"| speedup over D = {speedup}x  (p={pval})")
+
+    return rows, summary
+
+
+def run_policy_i_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                             num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                             fuzzy_selector=None):
+    """C vs I vs D -- the direct validation run for Policy I (see its
+    section docstring above _relay_utility_pool_i() for the full
+    diagnosis): does giving coverage_loss an absolute-scale membership
+    instead of C's pool-relative one close C's significant coverage_pct /
+    avg_zone_staleness_steps deficit against D, in the exact condition
+    where that deficit was originally found (default terrain, static
+    wind -- pass terrain_scenarios/wind_modes via
+    run_terrain_wind_generalization_analysis(policies=("C","D","I"))
+    instead of this function if you want the fuller multi-condition
+    check)?
+
+    Reports both:
+      - I vs C: isolates the normalization fix's own effect (same
+        weights, same energy/delay handling -- if this shows a real
+        coverage/staleness improvement with delay/energy staying flat,
+        that is direct evidence the fix works, not just noise)
+      - I vs D: the actual paper-relevant question -- does the gap that
+        motivated this fix actually close?
+    Plus matched-pairs rank-biserial effect sizes (same convention as
+    Relay_System.py's _paired_effect_stats()) alongside the p-values, not
+    just significance -- because "not significant" alone doesn't tell you
+    whether the deficit shrank a little or a lot.
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    fuzzy_selector = fuzzy_selector or select_fuzzy_relay_true_fis
+    rows = []
+    for seed in seeds:
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_i = simulate_fleet(seed, relay_selector=select_best_relay_coverage_aware,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=fuzzy_selector,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("C", m_c), ("I", m_i), ("D", m_d)):
+            for k, val in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = val
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"C(RelayScore): cov={m_c['coverage_pct']}% staleness={m_c['avg_zone_staleness_steps']}  |  "
+              f"I(RelayScore-CovFix): cov={m_i['coverage_pct']}% staleness={m_i['avg_zone_staleness_steps']}  |  "
+              f"D(fuzzy-MADM): cov={m_d['coverage_pct']}% staleness={m_d['avg_zone_staleness_steps']}")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("C", "I", "D"):
+            vals[label] = [r.get(f"{label}_{metric}") for r in rows]
+        entry = {}
+        for label in ("C", "I", "D"):
+            clean = [x for x in vals[label] if isinstance(x, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fix_effect_I_vs_C"] = _safe_wilcoxon(vals["I"], vals["C"])
+        entry["fix_effect_I_vs_C_rank_biserial"] = _rank_biserial_paired(vals["I"], vals["C"])
+        entry["gap_closed_I_vs_D"] = _safe_wilcoxon(vals["I"], vals["D"])
+        entry["gap_closed_I_vs_D_rank_biserial"] = _rank_biserial_paired(vals["I"], vals["D"])
+        entry["original_gap_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["original_gap_C_vs_D_rank_biserial"] = _rank_biserial_paired(vals["C"], vals["D"])
+        summary[metric] = entry
+
+    print("\n=== C vs I (RelayScore-CovFix) vs D SUMMARY ===")
+    print("(fix's own effect: I->C | does the gap close: I->D | original gap for reference: C->D)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fix_effect_I_vs_C", "I", "C"),
+            ("gap_closed_I_vs_D", "I", "D"),
+            ("original_gap_C_vs_D", "C", "D"),
+        ],
+        n=len(seeds),
+    )
+
+    print("\n--- Headline readout: did the fix work? ---")
+    cov = summary.get("coverage_pct", {})
+    stale = summary.get("avg_zone_staleness_steps", {})
+    print(f"coverage_pct:              C={cov.get('C_mean')}%  I={cov.get('I_mean')}%  D={cov.get('D_mean')}%  "
+          f"| I-vs-D p={ (cov.get('gap_closed_I_vs_D') or {}).get('wilcoxon_p') }  "
+          f"(was C-vs-D p={ (cov.get('original_gap_C_vs_D') or {}).get('wilcoxon_p') })")
+    print(f"avg_zone_staleness_steps:  C={stale.get('C_mean')}  I={stale.get('I_mean')}  D={stale.get('D_mean')}  "
+          f"| I-vs-D p={ (stale.get('gap_closed_I_vs_D') or {}).get('wilcoxon_p') }  "
+          f"(was C-vs-D p={ (stale.get('original_gap_C_vs_D') or {}).get('wilcoxon_p') })")
+    for metric in ("avg_relay_delay_steps", "avg_relay_energy_pct", "avg_selector_time_ms"):
+        m = summary.get(metric, {})
+        print(f"{metric} (should stay ~flat I vs C): C={m.get('C_mean')}  I={m.get('I_mean')}  "
+              f"| I-vs-C p={ (m.get('fix_effect_I_vs_C') or {}).get('wilcoxon_p') }")
+
+    return rows, summary
+
+
+def run_five_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                             num_reserves=RESERVE_POOL_SIZE, out_csv=None):
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay_true_fis,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_e = simulate_fleet(seed, relay_selector=select_best_relay_dynamic,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c), ("D", m_d), ("E", m_e)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"B(nearest): cov={m_b['coverage_pct']}%  |  "
+              f"C(RelayScore-static): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy-MADM): cov={m_d['coverage_pct']}%  |  "
+              f"E(RelayScore-dynamic): cov={m_e['coverage_pct']}%")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("A", "B", "C", "D", "E"):
+            vals[label] = [r[f"{label}_{metric}"] for r in rows]
+        entry = {}
+        for label in ("A", "B", "C", "D", "E"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fleet_effect_A_vs_B"] = _safe_wilcoxon(vals["A"], vals["B"])
+        entry["relay_intel_effect_B_vs_C"] = _safe_wilcoxon(vals["B"], vals["C"])
+        entry["relay_intel_effect_B_vs_D"] = _safe_wilcoxon(vals["B"], vals["D"])
+        entry["ranking_rule_effect_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["dynamic_weighting_effect_C_vs_E"] = _safe_wilcoxon(vals["C"], vals["E"])
+        entry["fully_refined_effect_D_vs_E"] = _safe_wilcoxon(vals["D"], vals["E"])
+        summary[metric] = entry
+
+    print("\n=== A vs B vs C vs D vs E SUMMARY ===")
+    print("(RelayScore vs fuzzy-MADM: C->D | dynamic layer's own effect: C->E | "
+          "fully-refined RelayScore vs fuzzy-MADM: D->E)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fleet_effect_A_vs_B", "A", "B"),
+            ("relay_intel_effect_B_vs_C", "B", "C"),
+            ("relay_intel_effect_B_vs_D", "B", "D"),
+            ("ranking_rule_effect_C_vs_D", "C", "D"),
+            ("dynamic_weighting_effect_C_vs_E", "C", "E"),
+            ("fully_refined_effect_D_vs_E", "D", "E"),
+        ],
+        n=len(seeds),
+    )
+    return rows, summary
+
+def run_six_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                             num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                             predictive_horizon=PREDICTIVE_COVERAGE_HORIZON):
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    predictive_selector = lambda needer, drones, g, detected, step, weights=None: \
+        select_best_relay_predictive(needer, drones, g, detected, step, weights=weights,
+                                       horizon=predictive_horizon)
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay_true_fis,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_e = simulate_fleet(seed, relay_selector=select_best_relay_dynamic,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_f = simulate_fleet(seed, relay_selector=predictive_selector,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c), ("D", m_d), ("E", m_e), ("F", m_f)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"C(static): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy): cov={m_d['coverage_pct']}%  |  "
+              f"E(dynamic-weight): cov={m_e['coverage_pct']}%  |  "
+              f"F(predictive): cov={m_f['coverage_pct']}%")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("A", "B", "C", "D", "E", "F"):
+            vals[label] = [r[f"{label}_{metric}"] for r in rows]
+        entry = {}
+        for label in ("A", "B", "C", "D", "E", "F"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fleet_effect_A_vs_B"] = _safe_wilcoxon(vals["A"], vals["B"])
+        entry["relay_intel_effect_B_vs_C"] = _safe_wilcoxon(vals["B"], vals["C"])
+        entry["ranking_rule_effect_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["dynamic_weighting_effect_C_vs_E"] = _safe_wilcoxon(vals["C"], vals["E"])
+        entry["predictive_effect_C_vs_F"] = _safe_wilcoxon(vals["C"], vals["F"])
+        entry["reweight_vs_predict_E_vs_F"] = _safe_wilcoxon(vals["E"], vals["F"])
+        entry["predictive_vs_fuzzy_D_vs_F"] = _safe_wilcoxon(vals["D"], vals["F"])
+        summary[metric] = entry
+
+    print("\n=== A vs B vs C vs D vs E vs F SUMMARY ===")
+    print(f"(predictive_horizon={predictive_horizon})")
+    print("(predictive effect: C->F | reweight-vs-predict: E->F | predictive vs fuzzy: D->F)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fleet_effect_A_vs_B", "A", "B"),
+            ("relay_intel_effect_B_vs_C", "B", "C"),
+            ("ranking_rule_effect_C_vs_D", "C", "D"),
+            ("dynamic_weighting_effect_C_vs_E", "C", "E"),
+            ("predictive_effect_C_vs_F", "C", "F"),
+            ("reweight_vs_predict_E_vs_F", "E", "F"),
+            ("predictive_vs_fuzzy_D_vs_F", "D", "F"),
+        ],
+        n=len(seeds),
+    )
+    return rows, summary
+
+def run_seven_way_comparison(seeds, max_steps=None, num_drones=NUM_DRONES,
+                               num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                               predictive_horizon=PREDICTIVE_COVERAGE_HORIZON):
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    predictive_selector = lambda needer, drones, g, detected, step, weights=None: \
+        select_best_relay_predictive(needer, drones, g, detected, step, weights=weights,
+                                       horizon=predictive_horizon)
+    for seed in seeds:
+        m_a = _extract_baseline_a_metrics(seed, max_steps)
+        m_b = simulate_fleet(seed, relay_selector=select_nearest_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay_true_fis,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_e = simulate_fleet(seed, relay_selector=select_best_relay_dynamic,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_f = simulate_fleet(seed, relay_selector=predictive_selector,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_g = simulate_fleet(seed, relay_selector=select_best_relay_battery_aware,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("A", m_a), ("B", m_b), ("C", m_c), ("D", m_d),
+                          ("E", m_e), ("F", m_f), ("G", m_g)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"C(static): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy): cov={m_d['coverage_pct']}%  |  "
+              f"F(predictive): cov={m_f['coverage_pct']}%  |  "
+              f"G(battery-aware): cov={m_g['coverage_pct']}%  |  "
+              f"G mission_completed={m_g['mission_completed']}")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("A", "B", "C", "D", "E", "F", "G"):
+            vals[label] = [r[f"{label}_{metric}"] for r in rows]
+        entry = {}
+        for label in ("A", "B", "C", "D", "E", "F", "G"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["fleet_effect_A_vs_B"] = _safe_wilcoxon(vals["A"], vals["B"])
+        entry["relay_intel_effect_B_vs_C"] = _safe_wilcoxon(vals["B"], vals["C"])
+        entry["ranking_rule_effect_C_vs_D"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["dynamic_weighting_effect_C_vs_E"] = _safe_wilcoxon(vals["C"], vals["E"])
+        entry["predictive_effect_C_vs_F"] = _safe_wilcoxon(vals["C"], vals["F"])
+        entry["battery_aware_effect_C_vs_G"] = _safe_wilcoxon(vals["C"], vals["G"])
+        entry["battery_vs_fuzzy_D_vs_G"] = _safe_wilcoxon(vals["D"], vals["G"])
+        entry["battery_vs_predictive_G_vs_F"] = _safe_wilcoxon(vals["G"], vals["F"])
+        summary[metric] = entry
+
+    print("\n=== A vs B vs C vs D vs E vs F vs G SUMMARY ===")
+    print(f"(predictive_horizon={predictive_horizon})")
+    print("(battery-aware effect: C->G | battery vs fuzzy: D->G | battery vs predictive: G->F)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("fleet_effect_A_vs_B", "A", "B"),
+            ("relay_intel_effect_B_vs_C", "B", "C"),
+            ("ranking_rule_effect_C_vs_D", "C", "D"),
+            ("dynamic_weighting_effect_C_vs_E", "C", "E"),
+            ("predictive_effect_C_vs_F", "C", "F"),
+            ("battery_aware_effect_C_vs_G", "C", "G"),
+            ("battery_vs_fuzzy_D_vs_G", "D", "G"),
+            ("battery_vs_predictive_G_vs_F", "G", "F"),
+        ],
+        n=len(seeds),
+    )
+    return rows, summary
+
+
+def run_policy_d_weight_robustness_check(seeds, max_steps=None, num_drones=NUM_DRONES,
+                                          num_reserves=RESERVE_POOL_SIZE, out_csv=None):
+    """RULE-BASE-CIRCULARITY ROBUSTNESS CHECK.
+
+    Reviewer concern this answers: Policy D's 81-rule rule base has its
+    THEN-clauses derived from FUZZY_ATTR_WEIGHTS (distance 0.30,
+    battery_margin 0.30, coverage_loss 0.25, relay_delay 0.15) -- the
+    same attribute-priority ordering that motivated RelayScore's own
+    NORMALIZED_WEIGHTS (0.35 / 0.40 / 0.25). If both policies are built
+    around a shared priority, the paper's "no significant coverage
+    cost" finding might just reflect that shared priority rather than
+    showing that a genuinely independent rule-based fuzzy-MADM
+    philosophy matches RelayScore's coverage.
+
+    This function runs THREE policies across the same seeded missions:
+        C        -- RelayScore (select_best_relay)
+        D        -- original Policy D, rule base from FUZZY_ATTR_WEIGHTS
+                     (shares its priority family with C; this is the
+                     policy reported everywhere else in the paper)
+        D_indep  -- Policy D-indep, rule base from INDEPENDENT_RULE_WEIGHTS
+                     (equal 0.25/0.25/0.25/0.25 importance -- chosen
+                     without reference to FUZZY_ATTR_WEIGHTS or
+                     NORMALIZED_WEIGHTS, and not tuned on these seeds)
+
+    and reports paired Wilcoxon signed-rank comparisons for every metric
+    in PRIMARY_METRICS + SECONDARY_METRICS (coverage_pct chief among
+    them), so the shared-weights vs. independent-weights comparison to
+    RelayScore can be read off side by side.
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    rows = []
+    for seed in seeds:
+        m_c = simulate_fleet(seed, relay_selector=select_best_relay,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d = simulate_fleet(seed, relay_selector=select_fuzzy_relay_true_fis,
+                              num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        m_d_indep = simulate_fleet(seed, relay_selector=select_fuzzy_relay_true_fis_indep_weights,
+                                    num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps)
+        row = {"seed": seed}
+        for label, m in (("C", m_c), ("D", m_d), ("D_indep", m_d_indep)):
+            for k, v in m.items():
+                if k in ("decision_log",):
+                    continue
+                row[f"{label}_{k}"] = v
+        rows.append(row)
+        print(f"[seed {seed}] "
+              f"C(RelayScore): cov={m_c['coverage_pct']}%  |  "
+              f"D(fuzzy-MADM, weights shared with C): cov={m_d['coverage_pct']}%  |  "
+              f"D_indep(fuzzy-MADM, equal/independent weights): cov={m_d_indep['coverage_pct']}%")
+
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    summary = {}
+    for metric in PRIMARY_METRICS + SECONDARY_METRICS:
+        vals = {}
+        for label in ("C", "D", "D_indep"):
+            vals[label] = [r[f"{label}_{metric}"] for r in rows]
+        entry = {}
+        for label in ("C", "D", "D_indep"):
+            clean = [v for v in vals[label] if isinstance(v, (int, float))]
+            entry[f"{label}_mean"] = round(statistics.mean(clean), 3) if clean else None
+        entry["C_vs_D_shared_weights"] = _safe_wilcoxon(vals["C"], vals["D"])
+        entry["C_vs_D_indep_weights"] = _safe_wilcoxon(vals["C"], vals["D_indep"])
+        entry["D_vs_D_indep_rule_base_sensitivity"] = _safe_wilcoxon(vals["D"], vals["D_indep"])
+        summary[metric] = entry
+
+    print("\n=== RULE-BASE-CIRCULARITY ROBUSTNESS CHECK: C vs D (shared weights) vs D-indep (equal weights) ===")
+    print("(C_vs_D_shared_weights: RelayScore vs original Policy D, same priority family as C | "
+          "C_vs_D_indep_weights: RelayScore vs Policy D built from an INDEPENDENT equal-weight rule base | "
+          "D_vs_D_indep_rule_base_sensitivity: how much the FIS's own output moves when its weight source changes)")
+    print(json.dumps(summary, indent=2, default=str))
+
+    _print_significance_summary(
+        summary,
+        comparisons=[
+            ("C_vs_D_shared_weights", "C", "D"),
+            ("C_vs_D_indep_weights", "C", "D_indep"),
+            ("D_vs_D_indep_rule_base_sensitivity", "D", "D_indep"),
+        ],
+        n=len(seeds),
+    )
+
+    cov = summary.get("coverage_pct", {})
+    shared_p = (cov.get("C_vs_D_shared_weights") or {}).get("wilcoxon_p")
+    indep_p = (cov.get("C_vs_D_indep_weights") or {}).get("wilcoxon_p")
+    print(
+        "\nInterpretation guide for coverage_pct "
+        f"(shared-weights p={shared_p}, independent-weights p={indep_p}):\n"
+        "  - If C_vs_D_indep_weights ALSO comes back not significant (matching\n"
+        "    C_vs_D_shared_weights), the 'no coverage cost' finding is robust to\n"
+        "    the rule-base-circularity concern: it does not depend on Policy D's\n"
+        "    rule base sharing FUZZY_ATTR_WEIGHTS with RelayScore's own weights.\n"
+        "  - If C_vs_D_indep_weights instead comes back SIGNIFICANT, that is\n"
+        "    itself an honest and useful finding -- it means part of the original\n"
+        "    result depended on the shared weight source, and the paper's\n"
+        "    Limitations section should say so explicitly rather than claim a\n"
+        "    fully independent rule-base comparison."
+    )
+    return rows, summary
+
+
+def run_fleet_size_sensitivity_analysis(seeds, fleet_sizes=((1, 1), (2, 2), (4, 4), (8, 8)),
+                                         max_steps=None, out_csv=None,
+                                         policies=("C", "D", "T", "V")):
+    """FLEET-SIZE SCALING SENSITIVITY (journal-extension experiment).
+
+    Reviewer concern this answers: every result in the paper is measured
+    at a single fixed fleet size (N_patrol=4, N_reserve=4 -> 8 drones).
+    RelayScore's claimed O(N) vs. Policy D's O(N*R) advantage, and the
+    "no significant coverage cost" finding, were never tested at other
+    fleet sizes -- so it is unclear whether either result is an artifact
+    of that one configuration. As of this revision, the SAME question is
+    also asked of TOPSIS (T) and VIKOR (V): does their speed advantage
+    over the true FIS also scale with fleet size, the way C's does, or is
+    C's scaling specific to its own formula? (see Section V-I's TOPSIS/
+    VIKOR comparison, which -- before this revision -- was only tested at
+    a single, fixed 8-drone fleet.)
+
+    This function reruns the same paired-seed design used in
+    run_four_way_comparison() / run_topsis_vikor_comparison(), but sweeps
+    across several fleet sizes. Each entry of `fleet_sizes` is a
+    (num_drones, num_reserves) pair; total fleet size = num_drones +
+    num_reserves. The default sweep (2, 4, 8, 16 drones) keeps the 1:1
+    patrol:reserve ratio used throughout the paper's 8-drone fleet
+    (N_patrol=4, N_reserve=4).
+
+    `policies`: which policy labels to run at each fleet size, from
+    POLICY_SELECTORS ("C"=RelayScore, "D"=true FIS, "T"=TOPSIS,
+    "V"=VIKOR). Defaults to all four. Pass e.g. policies=("C","D") to
+    reproduce the exact original C-vs-D-only sweep (same output keys,
+    same numbers) if you don't want the added T/V runtime cost.
+
+    For each fleet size, reports:
+      - mean coverage_pct, avg_relay_delay_steps, avg_relay_energy_pct
+        for every requested policy
+      - paired Wilcoxon significance AND matched-pairs rank-biserial
+        effect size (same convention as Relay_System.py's
+        _paired_effect_stats()) for every policy against D -- including
+        C-vs-D (kept for backward compatibility with the original
+        "coverage_test"/"delay_test"/"energy_test" keys) as well as the
+        new T-vs-D and V-vs-D pairs when T/V are requested
+      - mean avg_selector_time_ms and the resulting D-over-policy
+        per-decision speedup at that fleet size for every requested
+        policy -- the key scaling curve for the paper's fleet-size-
+        sensitivity figure, now covering T and V alongside C
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    all_rows = []
+    scaling_summary = []
+    non_d_policies = [p for p in policies if p != "D"]
+
+    def _mean(xs):
+        clean = [x for x in xs if isinstance(x, (int, float))]
+        return round(statistics.mean(clean), 4) if clean else None
+
+    for num_drones, num_reserves in fleet_sizes:
+        total_n = num_drones + num_reserves
+        rows = []
+        for seed in seeds:
+            metrics_by_policy = {}
+            for label in policies:
+                metrics_by_policy[label] = simulate_fleet(
+                    seed, relay_selector=POLICY_SELECTORS[label],
+                    num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps,
+                )
+            row = {"fleet_size": total_n, "num_drones": num_drones,
+                   "num_reserves": num_reserves, "seed": seed}
+            for label, m in metrics_by_policy.items():
+                for k, v in m.items():
+                    if k == "decision_log":
+                        continue
+                    row[f"{label}_{k}"] = v
+            rows.append(row)
+            all_rows.append(row)
+
+        metric_names = ("coverage_pct", "avg_relay_delay_steps",
+                         "avg_relay_energy_pct", "avg_selector_time_ms",
+                         "median_selector_time_ms", "total_selector_time_ms")
+        vals = {
+            label: {metric: [r[f"{label}_{metric}"] for r in rows] for metric in metric_names}
+            for label in policies
+        }
+
+        entry = {"fleet_size": total_n, "num_drones": num_drones, "num_reserves": num_reserves}
+        d_time_robust = None
+        for label in policies:
+            entry[f"{label}_coverage_pct"] = _mean(vals[label]["coverage_pct"])
+            entry[f"{label}_avg_relay_delay_steps"] = _mean(vals[label]["avg_relay_delay_steps"])
+            entry[f"{label}_avg_relay_energy_pct"] = _mean(vals[label]["avg_relay_energy_pct"])
+            entry[f"{label}_avg_selector_time_ms"] = _mean(vals[label]["avg_selector_time_ms"])
+            # Speedup is reported from the MEDIAN of each seed's per-mission
+            # median selector time, not the mean -- a single freak call
+            # (cold FIS cache build, OS scheduling hiccup) can otherwise
+            # inflate one seed's mean by orders of magnitude. See
+            # collect_metrics()'s median_selector_time_ms docstring.
+            med_times = [x for x in vals[label]["median_selector_time_ms"] if x is not None]
+            entry[f"{label}_median_selector_time_ms"] = round(statistics.median(med_times), 4) if med_times else None
+            if label == "D":
+                d_time_robust = entry[f"{label}_median_selector_time_ms"]
+
+        for label in non_d_policies:
+            if "D" not in policies:
+                continue
+            entry[f"coverage_test_{label}_vs_D"] = _safe_wilcoxon(vals[label]["coverage_pct"], vals["D"]["coverage_pct"])
+            entry[f"coverage_effect_{label}_vs_D"] = _rank_biserial_paired(vals[label]["coverage_pct"], vals["D"]["coverage_pct"])
+            entry[f"delay_test_{label}_vs_D"] = _safe_wilcoxon(vals[label]["avg_relay_delay_steps"], vals["D"]["avg_relay_delay_steps"])
+            entry[f"delay_effect_{label}_vs_D"] = _rank_biserial_paired(vals[label]["avg_relay_delay_steps"], vals["D"]["avg_relay_delay_steps"])
+            entry[f"energy_test_{label}_vs_D"] = _safe_wilcoxon(vals[label]["avg_relay_energy_pct"], vals["D"]["avg_relay_energy_pct"])
+            entry[f"energy_effect_{label}_vs_D"] = _rank_biserial_paired(vals[label]["avg_relay_energy_pct"], vals["D"]["avg_relay_energy_pct"])
+            entry[f"selector_time_test_{label}_vs_D"] = _safe_wilcoxon(vals[label]["median_selector_time_ms"], vals["D"]["median_selector_time_ms"])
+            label_time_robust = entry.get(f"{label}_median_selector_time_ms")
+            entry[f"speedup_D_over_{label}"] = round(d_time_robust / label_time_robust, 2) \
+                if (label_time_robust and d_time_robust and label_time_robust > 0) else None
+
+        # Backward-compatible aliases: old call sites (plot_fleet_size_scaling,
+        # any existing analysis scripts) look for these exact original names,
+        # which always meant "C vs D" -- keep them pointing at C specifically
+        # so nothing that consumed the old C-vs-D-only output breaks.
+        if "C" in policies and "D" in policies:
+            entry["coverage_test"] = entry.get("coverage_test_C_vs_D")
+            entry["delay_test"] = entry.get("delay_test_C_vs_D")
+            entry["energy_test"] = entry.get("energy_test_C_vs_D")
+            entry["selector_time_test"] = entry.get("selector_time_test_C_vs_D")
+            entry["speedup_D_over_C"] = entry.get("speedup_D_over_C")  # already set above
+            c_time = entry.get("C_avg_selector_time_ms")
+            d_time = entry.get("D_avg_selector_time_ms")
+            entry["speedup_D_over_C_mean_based"] = round(d_time / c_time, 2) if (c_time and d_time and c_time > 0) else None
+
+        scaling_summary.append(entry)
+
+        summary_bits = "  |  ".join(
+            f"{label}({POLICY_DISPLAY_NAMES[label]}) cov={entry[f'{label}_coverage_pct']}% "
+            f"delay={entry[f'{label}_avg_relay_delay_steps']} "
+            f"selector(median)={entry[f'{label}_median_selector_time_ms']}ms"
+            for label in policies
+        )
+        print(f"\n[fleet_size={total_n} (patrol={num_drones}, reserve={num_reserves})]  {summary_bits}")
+
+    if out_csv and all_rows:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+    print(f"\n=== FLEET-SIZE SCALING SENSITIVITY: {', '.join(policies)} across N ===")
+    print(json.dumps(scaling_summary, indent=2, default=str))
+    return all_rows, scaling_summary
+
+
+def plot_fleet_size_scaling(scaling_summary, save_path="fleet_size_scaling.png"):
+    """Plots per-decision selector runtime and D-over-policy speedup
+    against fleet size N -- the figure for the paper's fleet-size-
+    sensitivity subsection. Plots whichever of C/D/T/V are present in
+    scaling_summary (all four if run_fleet_size_sensitivity_analysis()
+    was called with its new default policies=("C","D","T","V"); just
+    C and D if it was called with the old policies=("C","D"))."""
+    if 'plt' not in globals():
+        print("❌ Cannot plot: matplotlib is missing.")
+        return
+
+    sizes = [e["fleet_size"] for e in scaling_summary]
+    colors = {"C": "tab:blue", "D": "tab:orange", "T": "tab:green", "V": "tab:purple"}
+    present = [label for label in ("C", "D", "T", "V")
+               if all(f"{label}_median_selector_time_ms" in e for e in scaling_summary)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for label in present:
+        times = [e[f"{label}_median_selector_time_ms"] for e in scaling_summary]
+        name = POLICY_DISPLAY_NAMES.get(label, label)
+        axes[0].plot(sizes, times, marker="o", label=f"{name} ({label})", color=colors.get(label))
+    axes[0].set_xlabel("Fleet size (N drones)")
+    axes[0].set_ylabel("Median selector time (ms)")
+    axes[0].set_title("Per-decision runtime vs. fleet size")
+    axes[0].legend()
+
+    for label in present:
+        if label == "D":
+            continue
+        key = "speedup_D_over_C" if label == "C" else f"speedup_D_over_{label}"
+        if not all(key in e for e in scaling_summary):
+            continue
+        speedup = [e[key] for e in scaling_summary]
+        name = POLICY_DISPLAY_NAMES.get(label, label)
+        axes[1].plot(sizes, speedup, marker="o", label=f"{name} ({label})", color=colors.get(label))
+    axes[1].set_xlabel("Fleet size (N drones)")
+    axes[1].set_ylabel("Speedup (D / policy, median-based)")
+    axes[1].set_title("Speedup over true FIS vs. fleet size")
+    if len(present) > 2:
+        axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    print(f"✅ Saved fleet-size scaling plot to {save_path}")
+
+
+def run_terrain_wind_generalization_analysis(seeds, terrain_scenarios=None, wind_modes=("static", "dynamic", "stochastic"),
+                                               max_steps=None, num_drones=NUM_DRONES,
+                                               num_reserves=RESERVE_POOL_SIZE, out_csv=None,
+                                               policies=("C", "D", "T", "V")):
+    """TERRAIN x WIND GENERALIZATION SWEEP (journal-extension experiment).
+
+    Reviewer concern this answers: every result in the paper comes from
+    ONE terrain (the flat Benapole delta) and ONE wind family (either the
+    fixed static value, or the single deterministic sinusoidal profile
+    that is IDENTICAL across every seed) -- see Section VI, "Single
+    simulated environment". This function reruns the same paired-seed
+    design used throughout the paper, but crossed over:
+      - terrain_scenarios: names from a20.TERRAIN_SCENARIOS (default: all
+        four -- benapole_delta, sylhet_hills, coxs_bazar,
+        chittagong_hill_tracts), switched via a20.set_terrain_scenario();
+      - wind_modes: "static" (fixed WIND_SPEED/WIND_DIR), "dynamic" (the
+        paper's original deterministic sinusoidal profile -- identical
+        wind across every seed at a given step), and "stochastic" (a NEW
+        per-seed random-walk wind -- genuinely different weather on every
+        seed; see a20.set_wind_mode()'s docstring). Switched per-seed
+        (not once for the whole batch), because "stochastic" mode's
+        trajectory is keyed to the seed -- this loop does NOT reuse
+        run_four_way_comparison()/simulate_fleet()'s seed batching for
+        that reason.
+
+    `policies`: which policy labels to run in every (terrain, wind_mode)
+    cell, from POLICY_SELECTORS ("C"=RelayScore, "D"=true FIS,
+    "T"=TOPSIS, "V"=VIKOR). Defaults to all four -- previously TOPSIS/
+    VIKOR were only ever tested on the single default terrain under
+    static wind (Section V-I), while C-vs-D got the full 12-cell sweep;
+    this closes that asymmetry. Pass policies=("C","D") to reproduce the
+    exact original C-vs-D-only sweep (identical output keys/numbers).
+
+    For each (terrain, wind_mode) combination, reports mean coverage_pct,
+    avg_relay_delay_steps, avg_relay_energy_pct for every requested
+    policy, with paired Wilcoxon significance AND matched-pairs rank-
+    biserial effect size (same convention as Relay_System.py's
+    _paired_effect_stats()) for every non-D policy against D -- so the
+    paper's core "X matches D on coverage while being faster/cheaper"
+    finding can be read off across every combination and every policy,
+    not just C on the one originally-tested cell.
+
+    IMPORTANT: this permanently changes a20's module-level terrain/wind
+    state as it runs (that's how a20.set_terrain_scenario()/
+    set_wind_mode() work -- see their docstrings). It resets wind mode to
+    "static" when done, but does NOT reset terrain back to
+    "benapole_delta" -- call a20.set_terrain_scenario("benapole_delta")
+    yourself afterward if subsequent code in the same process depends on
+    the paper's original terrain being active.
+    """
+    max_steps = max_steps or a20.MAX_STEPS
+    terrain_scenarios = terrain_scenarios or list(a20.TERRAIN_SCENARIOS.keys())
+    non_d_policies = [p for p in policies if p != "D"]
+
+    def _mean(xs):
+        clean = [x for x in xs if isinstance(x, (int, float))]
+        return round(statistics.mean(clean), 4) if clean else None
+
+    all_rows = []
+    scenario_summary = []
+
+    try:
+        for terrain in terrain_scenarios:
+            a20.set_terrain_scenario(terrain)
+
+            for wind_mode in wind_modes:
+                rows = []
+                for seed in seeds:
+                    if wind_mode == "stochastic":
+                        a20.set_wind_mode("stochastic", seed=seed, n_steps=max_steps + 1)
+                    else:
+                        a20.set_wind_mode(wind_mode)
+
+                    metrics_by_policy = {}
+                    for label in policies:
+                        metrics_by_policy[label] = simulate_fleet(
+                            seed, relay_selector=POLICY_SELECTORS[label],
+                            num_drones=num_drones, num_reserves=num_reserves, max_steps=max_steps,
+                        )
+
+                    row = {"terrain": terrain, "wind_mode": wind_mode, "seed": seed}
+                    for label, m in metrics_by_policy.items():
+                        for k, v in m.items():
+                            if k == "decision_log":
+                                continue
+                            row[f"{label}_{k}"] = v
+                    rows.append(row)
+                    all_rows.append(row)
+
+                metric_names = ("coverage_pct", "avg_relay_delay_steps", "avg_relay_energy_pct")
+                vals = {
+                    label: {metric: [r[f"{label}_{metric}"] for r in rows] for metric in metric_names}
+                    for label in policies
+                }
+                # Selector-timing aggregation uses the MEDIAN of each seed's own
+                # per-mission median call time, not the mean -- see
+                # collect_metrics()'s median_selector_time_ms docstring. A
+                # single freak call (cold FIS cache build, OS scheduling
+                # hiccup) can otherwise inflate one seed's average by orders
+                # of magnitude with only ~15-25 calls per mission to dilute
+                # it, which previously produced wildly inconsistent
+                # "speedup" numbers across terrain/wind cells that were pure
+                # measurement noise, not a real effect.
+                med_times = {}
+                for label in policies:
+                    times = [r[f"{label}_median_selector_time_ms"] for r in rows
+                             if r.get(f"{label}_median_selector_time_ms") is not None]
+                    med_times[label] = round(statistics.median(times), 4) if times else None
+
+                entry = {"terrain": terrain, "wind_mode": wind_mode}
+                for label in policies:
+                    for metric in metric_names:
+                        entry[f"{label}_{metric}"] = _mean(vals[label][metric])
+                    entry[f"{label}_median_selector_time_ms"] = med_times[label]
+
+                d_time_robust = med_times.get("D")
+                for label in non_d_policies:
+                    if "D" not in policies:
+                        continue
+                    for metric in metric_names:
+                        entry[f"{metric}_test_{label}_vs_D"] = _safe_wilcoxon(vals[label][metric], vals["D"][metric])
+                        entry[f"{metric}_effect_{label}_vs_D"] = _rank_biserial_paired(vals[label][metric], vals["D"][metric])
+                    label_time_robust = med_times.get(label)
+                    entry[f"speedup_D_over_{label}_median_based"] = round(d_time_robust / label_time_robust, 1) \
+                        if (label_time_robust and d_time_robust and label_time_robust > 0) else None
+
+                # Backward-compatible aliases for old C-vs-D-only key names
+                # (plot_terrain_wind_generalization() and any existing
+                # analysis scripts look these up directly).
+                if "C" in policies and "D" in policies:
+                    for metric in metric_names:
+                        entry[f"{metric}_test"] = entry.get(f"{metric}_test_C_vs_D")
+                    entry["speedup_D_over_C_median_based_legacy"] = entry.get("speedup_D_over_C_median_based")
+
+                scenario_summary.append(entry)
+
+                summary_bits = "  |  ".join(
+                    f"{label} cov={entry[f'{label}_coverage_pct']}% "
+                    f"delay={entry[f'{label}_avg_relay_delay_steps']} "
+                    f"energy={entry[f'{label}_avg_relay_energy_pct']} "
+                    f"selector(median)={entry[f'{label}_median_selector_time_ms']}ms"
+                    for label in policies
+                )
+                print(f"\n[terrain={terrain} wind={wind_mode}]  {summary_bits}")
+    finally:
+        a20.set_wind_mode("static")   # always leave wind in the safe default state
+        # FIX: also always reset terrain to the paper's baseline sector.
+        # Previously this was left to the CALLER (Relay_System.py's
+        # _run_terrain_wind_sweep() wrapper did it; this function itself did
+        # not) -- any script that calls this function directly, without going
+        # through that wrapper, silently left a20 stuck on whichever terrain
+        # was swept LAST (chittagong_hill_tracts, the most rugged of the
+        # four, since it's last in TERRAIN_SCENARIOS). A subsequent sweep in
+        # the same process/script (e.g. run_fleet_size_sensitivity_analysis()
+        # called right after this one) would then silently run on that wrong,
+        # rugged terrain -- fewer feasible relay candidates there means both
+        # lower coverage_pct AND much faster (misleadingly fast) selector
+        # times, exactly the anomaly this fix closes.
+        a20.set_terrain_scenario("benapole_delta")
+
+    if out_csv and all_rows:
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+    print(f"\n=== TERRAIN x WIND GENERALIZATION SWEEP: {', '.join(policies)} ===")
+    print(json.dumps(scenario_summary, indent=2, default=str))
+    return all_rows, scenario_summary
+
+
+if __name__ == "__main__":
+    import sys
+
+    steps = int(sys.argv[1]) if len(sys.argv) > 1 else 300
+    num_seeds = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    seeds = list(range(1, num_seeds + 1))
+    quick_seeds = seeds[:5]
+
+    print("\n=== B vs C: FEASIBLE-NEAREST vs CORRECTED RELAYSCORE ===")
+    rows, summary = run_comparison(
+        seeds, max_steps=steps, out_csv="fleet_relay_comparison_fixed.csv"
+    )
+    print(json.dumps(summary, indent=2, default=str))
+
+    print("\n=== GENERATING DECISION BREAKDOWN CHART ===")
+    state_metrics = simulate_fleet(1, select_best_relay, max_steps=steps)
+    d_log = state_metrics.get("decision_log", [])
+    if d_log:
+        interesting_logs = [x for x in d_log if len(x["candidates_diag"]) > 1]
+        target_log = interesting_logs[0] if interesting_logs else d_log[0]
+        plot_decision_breakdown(
+            target_log,
+            save_path="decision_breakdown_fixed.png"
+        )
+    else:
+        print("ℹ️ No relay decisions occurred in this run to plot.")
+
+    print("\n=== SENSITIVITY: W_COVERAGE_LOSS ===")
+    sens_results = run_sensitivity_analysis(
+        "W_COVERAGE_LOSS",
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        seeds=quick_seeds,
+        max_steps=steps,
+        out_csv="sensitivity_coverage_weight_fixed.csv",
+    )
+    plot_sensitivity(
+        sens_results,
+        "W_COVERAGE_LOSS",
+        metric="coverage_pct",
+        save_path="sensitivity_coverage_weight_fixed.png",
+    )
+
+    print("\n=== THREE-WAY: A original | B feasible-nearest | C corrected RelayScore ===")
+    abc_rows, abc_summary = run_three_way_comparison(
+        seeds,
+        max_steps=steps,
+        out_csv="abc_comparison_fixed.csv",
+    )
+    print(json.dumps(abc_summary, indent=2, default=str))
+
+    print("\n=== FOUR-WAY: A original | B nearest | C RelayScore | D fuzzy-MADM (paper-adapted) ===")
+    abcd_rows, abcd_summary = run_four_way_comparison(
+        seeds,
+        max_steps=steps,
+        out_csv="abcd_comparison_with_fuzzy.csv",
+    )
+
+    print("\n=== RULE-BASE-CIRCULARITY ROBUSTNESS CHECK: C vs D (shared weights) vs D-indep (independent weights) ===")
+    d_robustness_rows, d_robustness_summary = run_policy_d_weight_robustness_check(
+        seeds,
+        max_steps=steps,
+        out_csv="policy_d_weight_robustness_check.csv",
+    )
+
+    print("\n=== FLEET-SIZE SENSITIVITY: RelayScore (C) vs true FIS (D) across N = 2,4,8,16 drones ===")
+    # (num_drones, num_reserves) pairs, 1:1 patrol:reserve ratio matching the
+    # paper's 8-drone fleet (N_patrol=4, N_reserve=4) -- run on quick_seeds by
+    # default since this sweep is 4x the simulate_fleet calls of a normal run;
+    # swap in `seeds` for the full n=30 paired run reported in the paper.
+    fleet_rows, fleet_scaling_summary = run_fleet_size_sensitivity_analysis(
+        quick_seeds,
+        fleet_sizes=((1, 1), (2, 2), (4, 4), (8, 8)),
+        max_steps=steps,
+        out_csv="fleet_size_sensitivity.csv",
+    )
+    plot_fleet_size_scaling(fleet_scaling_summary, save_path="fleet_size_scaling.png")
+
+    print("\n=== TERRAIN x WIND GENERALIZATION: RelayScore (C) vs true FIS (D) across "
+          "4 terrains x {static, dynamic, stochastic} wind ===")
+    # Full n=30 paired seeds (matches the paper's main experiments) -- swap in
+    # quick_seeds instead if you just want a fast sanity check before committing
+    # to the full run (4 terrains x 3 wind modes x len(seeds) x 2 policies
+    # simulate_fleet() calls -- this is the slow one because of Policy D's FIS cost).
+    # Requires internet access on first call per terrain (downloads/caches real
+    # NASA SRTM tiles) -- see a20.prime_srtm_cache() if that fails in your environment.
+    terrain_wind_rows, terrain_wind_summary = run_terrain_wind_generalization_analysis(
+        seeds,
+        max_steps=steps,
+        out_csv="terrain_wind_generalization.csv",
+    )
+    a20.set_terrain_scenario("benapole_delta")  # restore the paper's original terrain
+    print(json.dumps(abcd_summary, indent=2, default=str))

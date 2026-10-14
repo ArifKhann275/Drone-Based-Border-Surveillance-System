@@ -1,0 +1,34 @@
+{
+  "tuned_weights": {
+    "W_TRAVEL_ENERGY": 0.2102688526563818,
+    "W_COVERAGE_LOSS": 0.766280664854605,
+    "W_RELAY_DELAY": 0.023450482489013182
+  },
+  "base_weights": {
+    "W_TRAVEL_ENERGY": 0.35,
+    "W_COVERAGE_LOSS": 0.4,
+    "W_RELAY_DELAY": 0.25
+  },
+  "tune_seeds": [
+    101,
+    150
+  ],
+  "tune_steps": 500,
+  "test_seeds": [
+    1,
+    50
+  ],
+  "fleet": {
+    "num_drones": 4,
+    "num_reserves": 4
+  },
+  "optimizer": {
+    "method": "scipy.optimize.differential_evolution",
+    "popsize": 12,
+    "maxiter": 25,
+    "evaluations": 579,
+    "elapsed_s": 69007.8,
+    "seed": 0
+  },
+  "tuning_objective_value_mean_coverage_pct": 91.706
+}
